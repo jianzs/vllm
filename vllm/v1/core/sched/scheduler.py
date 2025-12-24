@@ -49,6 +49,7 @@ from vllm.v1.metrics.stats import (
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -212,6 +213,9 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        self.is_mtp_kv_consumer = self.vllm_config.speculative_config is not None and \
+                                        self.vllm_config.kv_transfer_config is not None \
+                                        and self.vllm_config.kv_transfer_config.is_kv_consumer
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -523,7 +527,11 @@ class Scheduler(SchedulerInterface):
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
-                    num_new_tokens = request.num_tokens - num_computed_tokens
+                    if self.is_mtp_kv_consumer:
+                        num_new_tokens = (request.num_tokens_with_spec -
+                                          num_computed_tokens)
+                    else:
+                        num_new_tokens = request.num_tokens - num_computed_tokens
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
@@ -617,6 +625,17 @@ class Scheduler(SchedulerInterface):
 
                 self._update_connector_prefix_cache_stats(request)
 
+                req_index += 1
+                # Speculative decode related.
+                if self.is_mtp_kv_consumer and request.spec_token_ids:
+                    num_scheduled_spec_tokens = (num_new_tokens +
+                                                 num_computed_tokens -
+                                                 request.num_tokens)
+                    if num_scheduled_spec_tokens > 0:
+                        # Trim spec_token_ids list to num_scheduled_spec_tokens.
+                        del request.spec_token_ids[num_scheduled_spec_tokens:]
+                        scheduled_spec_decode_tokens[request.request_id] = (
+                            request.spec_token_ids)
                 self.running.append(request)
                 if self.log_stats:
                     request.record_event(
@@ -1345,6 +1364,13 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting)
 
     def add_request(self, request: Request) -> None:
+        if self.is_mtp_kv_consumer:
+            # fill spec_token_ids with PLACEHOLDER_TOKEN_ID
+            num_speculative_tokens = self.vllm_config.speculative_config.num_speculative_tokens
+            if num_speculative_tokens is None:
+                num_speculative_tokens = 1
+            request.spec_token_ids = [PLACEHOLDER_TOKEN_ID
+                                      ] * num_speculative_tokens
         self.waiting.add_request(request)
         self.requests[request.request_id] = request
         if self.log_stats:

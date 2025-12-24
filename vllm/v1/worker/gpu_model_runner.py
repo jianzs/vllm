@@ -1008,6 +1008,47 @@ class GPUModelRunner(
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
             self.input_batch.add_request(request)
+            
+            req_id = request.req_id
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            assert req_index is not None
+            
+            req_state = self.requests[req_id]
+
+            # Add spec_token_ids to token_ids_cpu.
+            spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(
+                req_id, []
+            )
+            num_spec_tokens = len(spec_token_ids)
+            # For async scheduling, token_ids_cpu assigned from
+            # spec_token_ids are placeholders and will be overwritten in
+            # _prepare_input_ids.
+            if num_spec_tokens:
+                start_index = self.input_batch.num_tokens_no_spec[req_index]
+                end_token_index = start_index + num_spec_tokens
+                self.input_batch.token_ids_cpu[
+                    req_index, start_index:end_token_index
+                ] = spec_token_ids
+                # NOTE(woosuk): `num_tokens` here may include spec tokens.
+                self.input_batch.num_tokens[req_index] += num_spec_tokens
+
+            # When speculative decoding is used with structured output,
+            # the scheduler can drop draft tokens that do not
+            # conform to the schema. This can result in
+            # scheduler_output.scheduled_spec_decode_tokens being empty,
+            # even when speculative decoding is enabled.
+            self.input_batch.spec_token_ids[req_index].clear()
+            self.input_batch.spec_token_ids[req_index].extend(spec_token_ids)
+
+            # there are no draft tokens with async scheduling,
+            # we clear the spec_decoding info in scheduler_output and
+            # use normal sampling but rejection_sampling.
+            if self.use_async_scheduling:
+                req_state.prev_num_draft_len = num_spec_tokens
+                # if num_spec_tokens and self._draft_token_ids is None:
+                #     scheduler_output.total_num_scheduled_tokens -= num_spec_tokens
+                #     scheduler_output.num_scheduled_tokens[req_id] -= num_spec_tokens
+                #     scheduler_output.scheduled_spec_decode_tokens.pop(req_id, None)
 
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()
