@@ -258,6 +258,7 @@ class OpenAIServingChat(OpenAIServing):
         request_id = (
             f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
         )
+        request.request_id = request_id
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:
@@ -269,6 +270,8 @@ class OpenAIServingChat(OpenAIServing):
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
+            assert raw_request is not None
+            vllm_config = raw_request.app.state.vllm_config
             for i, engine_prompt in enumerate(engine_prompts):
                 prompt_text, _, _ = self._get_prompt_components(engine_prompt)
                 # If we are creating sub requests for multiple prompts, ensure that they
@@ -285,6 +288,7 @@ class OpenAIServingChat(OpenAIServing):
                     request=request,
                     input_length=len(engine_prompt["prompt_token_ids"]),
                     default_sampling_params=self.default_sampling_params,
+                    vllm_config=vllm_config,
                 )
 
                 sampling_params: SamplingParams | BeamSearchParams
@@ -332,6 +336,7 @@ class OpenAIServingChat(OpenAIServing):
                         lora_request=lora_request,
                         trace_headers=trace_headers,
                         priority=request.priority,
+                        data_parallel_rank=data_parallel_rank,
                     )
 
                     generator = self.engine_client.generate(

@@ -117,6 +117,7 @@ class OpenAIServingCompletion(OpenAIServing):
             )
 
         request_id = f"cmpl-{self._base_request_id(raw_request, request.request_id)}"
+        request.request_id = request_id
         created_time = int(time.time())
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
@@ -150,12 +151,32 @@ class OpenAIServingCompletion(OpenAIServing):
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(str(e))
 
+        if len(engine_prompts) > 1:
+            raise NotImplementedError(
+                "Batching of multiple prompts is not supported for "
+                "completion requests. Please use a single prompt.")
+        try:
+            kv_transfer_params = request.kv_transfer_params
+            if kv_transfer_params is not None and \
+                kv_transfer_params.get("do_remote_prefill", False):
+                last_token_id = kv_transfer_params.get("last_token_id", None)
+                if last_token_id is None:
+                    raise ValueError(
+                        "In disaggregated prefill mode, "
+                        "kv_transfer_params must contain the 'last_token_id' key, "
+                        f"but received: {kv_transfer_params}")
+                engine_prompts[0]["prompt_token_ids"] += [last_token_id]
+        except ValueError as e:
+            return self.create_error_response(str(e))
+
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
 
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
+            assert raw_request is not None
+            vllm_config = raw_request.app.state.vllm_config
             for i, engine_prompt in enumerate(engine_prompts):
                 prompt_text, prompt_token_ids, prompt_embeds = (
                     self._get_prompt_components(engine_prompt)
@@ -177,6 +198,7 @@ class OpenAIServingCompletion(OpenAIServing):
                     request=request,
                     input_length=input_length,
                     default_sampling_params=self.default_sampling_params,
+                    vllm_config=vllm_config,
                 )
 
                 sampling_params: SamplingParams | BeamSearchParams
@@ -230,6 +252,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         lora_request=lora_request,
                         trace_headers=trace_headers,
                         priority=request.priority,
+                        data_parallel_rank=data_parallel_rank,
                     )
 
                     generator = self.engine_client.generate(
@@ -719,9 +742,8 @@ class OpenAIServingCompletion(OpenAIServing):
         request: CompletionRequest,
         max_input_length: int | None = None,
     ) -> RenderConfig:
-        max_input_tokens_len = self.max_model_len - (request.max_tokens or 0)
         return RenderConfig(
-            max_length=max_input_tokens_len,
+            max_length=self.max_model_len,
             truncate_prompt_tokens=request.truncate_prompt_tokens,
             add_special_tokens=request.add_special_tokens,
             cache_salt=request.cache_salt,

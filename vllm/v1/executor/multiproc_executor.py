@@ -11,7 +11,7 @@ import traceback
 import weakref
 from collections import deque
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future, InvalidStateError
+from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -152,9 +152,10 @@ class MultiprocExecutor(Executor):
             global_start_rank = (
                 self.local_world_size * self.parallel_config.node_rank_within_dp
             )
+            unready_workers_builders: list[Callable[[], UnreadyWorkerProcHandle]] = []
             for local_rank in range(self.local_world_size):
                 global_rank = global_start_rank + local_rank
-                unready_workers.append(
+                unready_workers_builders.append(
                     WorkerProc.make_worker_process(
                         vllm_config=self.vllm_config,
                         local_rank=local_rank,
@@ -164,6 +165,9 @@ class MultiprocExecutor(Executor):
                         shared_worker_lock=shared_worker_lock,
                     )
                 )
+
+            with ThreadPoolExecutor(max_workers=len(unready_workers_builders)) as e:
+                unready_workers = list(e.map(lambda p: p(), unready_workers_builders))
 
             # Workers must be created before wait_for_ready to avoid
             # deadlock, since worker.init_device() does a device sync.
@@ -573,7 +577,7 @@ class WorkerProc:
         distributed_init_method: str,
         input_shm_handle,  # Receive SchedulerOutput
         shared_worker_lock: LockType,
-    ) -> UnreadyWorkerProcHandle:
+    ) -> Callable[[], UnreadyWorkerProcHandle]:
         context = get_mp_context()
         # (reader, writer)
         reader, writer = context.Pipe(duplex=False)
@@ -599,11 +603,14 @@ class WorkerProc:
             daemon=True,
         )
 
-        proc.start()
-        writer.close()
-        # Keep death_writer open in parent - when parent exits,
-        # death_reader in child will get EOFError
-        return UnreadyWorkerProcHandle(proc, rank, reader, death_writer)
+        def start_proc():
+            proc.start()
+            writer.close()
+            # Keep death_writer open in parent - when parent exits,
+            # death_reader in child will get EOFError
+            return UnreadyWorkerProcHandle(proc, rank, reader, death_writer)
+
+        return start_proc
 
     @staticmethod
     def wait_for_response_handle_ready(

@@ -1024,15 +1024,6 @@ class OpenAIServing:
                 "the input messages."
             )
 
-        if max_tokens is not None and token_num + max_tokens > self.max_model_len:
-            raise ValueError(
-                "'max_tokens' or 'max_completion_tokens' is too large: "
-                f"{max_tokens}. This model's maximum context length is "
-                f"{self.max_model_len} tokens and your request has "
-                f"{token_num} input tokens ({max_tokens} > {self.max_model_len}"
-                f" - {token_num})."
-            )
-
         return TokensPrompt(prompt=input_text, prompt_token_ids=input_ids)
 
     async def _tokenize_prompt_input_async(
@@ -1204,7 +1195,19 @@ class OpenAIServing:
                 prompt_token_ids=request_prompt,
             )
 
-        engine_prompt = TokensPrompt(prompt_token_ids=prompt_inputs["prompt_token_ids"])
+        prompt_token_ids = prompt_inputs["prompt_token_ids"]
+        kv_transfer_params = request.kv_transfer_params
+        if kv_transfer_params is not None and \
+            kv_transfer_params.get("do_remote_prefill", False):
+            last_token_id = kv_transfer_params.get("last_token_id", None)
+            if last_token_id is None:
+                raise ValueError(
+                    "In disaggregated prefill mode, "
+                    "kv_transfer_params must contain the 'last_token_id' key, "
+                    f"but received: {kv_transfer_params}")
+            prompt_token_ids += [last_token_id]
+
+        engine_prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
         if "prompt" in prompt_inputs:
             engine_prompt["prompt"] = prompt_inputs["prompt"]
 
@@ -1231,6 +1234,7 @@ class OpenAIServing:
         lora_request: LoRARequest | None,
         trace_headers: Mapping[str, str] | None,
         priority: int,
+        data_parallel_rank: int | None = None,
     ) -> tuple[EngineCoreRequest, dict[str, Any]]:
         """Use the Processor to process inputs for AsyncLLM."""
         tokenization_kwargs: dict[str, Any] = {}
@@ -1246,6 +1250,7 @@ class OpenAIServing:
             tokenization_kwargs=tokenization_kwargs,
             trace_headers=trace_headers,
             priority=priority,
+            data_parallel_rank=data_parallel_rank,
         )
         return engine_request, tokenization_kwargs
 

@@ -823,6 +823,14 @@ class EngineCoreProc(EngineCore):
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         """Launch EngineCore busy loop in background process."""
 
+        from vllm.v1.engine.utils import set_device_control_env_var
+        with set_device_control_env_var(kwargs["vllm_config"], local_dp_rank):
+            EngineCoreProc._run_engine_core(
+                *args, dp_rank=dp_rank, local_dp_rank=local_dp_rank, **kwargs)
+
+    @staticmethod
+    def _run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
+
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker
         # processes to terminate without error

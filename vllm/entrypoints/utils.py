@@ -13,7 +13,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask, BackgroundTasks
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, VllmConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import (
@@ -208,21 +208,38 @@ def get_max_tokens(
     request: ChatCompletionRequest | CompletionRequest,
     input_length: int,
     default_sampling_params: dict,
+    vllm_config: VllmConfig | None = None,
 ) -> int:
-    max_tokens = getattr(request, "max_completion_tokens", None) or request.max_tokens
+    user_max_tokens = getattr(request, "max_completion_tokens", None) or request.max_tokens
     default_max_tokens = max_model_len - input_length
-    max_output_tokens = current_platform.get_max_output_tokens(input_length)
+    system_max_tokens = current_platform.get_max_output_tokens(input_length)
 
-    return min(
+    if vllm_config and vllm_config.kv_transfer_config and \
+        not vllm_config.kv_transfer_config.is_kv_consumer:
+        # Force the prefill node to set max_tokens=1
+        return 1
+
+    final_max_token = min(
         val
         for val in (
             default_max_tokens,
-            max_tokens,
-            max_output_tokens,
+            user_max_tokens,
+            system_max_tokens,
             default_sampling_params.get("max_tokens"),
         )
         if val is not None
     )
+    if user_max_tokens is not None and final_max_token < user_max_tokens:
+        logger.warning(
+            f"Modified request {request.request_id}: "
+            f"This model's maximum context length is "
+            f"{max_model_len} tokens. However, you requested "
+            f"{user_max_tokens + input_length} tokens "
+            f"({input_length} in the messages, "
+            f"{user_max_tokens} in the completion). "
+            f"Theta vllm-ascend will automatically truncate the "
+            f"output tokens to {final_max_token} to fit the model's context length. ")
+    return final_max_token
 
 
 def log_non_default_args(args: Namespace | EngineArgs):

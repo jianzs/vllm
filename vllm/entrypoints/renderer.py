@@ -395,7 +395,7 @@ class CompletionRenderer(BaseRenderer):
         prompt: str | None = None,
     ) -> TokensPrompt:
         """Create validated TokensPrompt."""
-        if max_length is not None and len(token_ids) > max_length:
+        if max_length is not None and len(token_ids) >= max_length:
             raise ValueError(
                 f"This model's maximum context length is {max_length} tokens. "
                 f"However, your request has {len(token_ids)} input tokens. "
