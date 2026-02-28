@@ -3,6 +3,7 @@
 
 import contextlib
 import os
+import threading
 import weakref
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -20,7 +21,11 @@ from vllm.config import CacheConfig, ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.ray.ray_env import get_env_vars_to_copy
-from vllm.utils.network_utils import get_open_zmq_ipc_path, zmq_socket_ctx
+from vllm.utils.network_utils import (
+    get_open_zmq_ipc_path,
+    make_zmq_socket,
+    zmq_socket_ctx,
+)
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.executor import Executor
@@ -64,6 +69,8 @@ class EngineZmqAddresses:
     # Not used by engine, just relayed to front-end in handshake response.
     # Only required for external DP LB case.
     frontend_stats_publish_address: str | None = None
+    # ZMQ socket address for EngineRegistry (elastic EP scale-down with MP)
+    engine_registry_address: str | None = None
 
 
 @dataclass
@@ -75,6 +82,19 @@ class EngineHandshakeMetadata:
 
     addresses: EngineZmqAddresses
     parallel_config: dict[str, int | str | list[int]]
+
+
+@dataclass
+class EngineProcMgrMetadata:
+    """Metadata for tracking engine process managers during elastic EP scaling.
+
+    Used by EngineRegistry to track which engine process managers are
+    responsible for which DP ranks, enabling proper notification during
+    scale-down events.
+    """
+
+    start_dp_rank: int
+    local_dp_size: int
 
 
 class CoreEngineProcManager:
@@ -915,6 +935,10 @@ def launch_core_engines(
         handshake_local_only, host, parallel_config.data_parallel_rpc_port
     )
 
+    # Set engine registry address for elastic EP scale-down with multiproc
+    if parallel_config.enable_elastic_ep:
+        addresses.engine_registry_address = handshake_address
+
     if local_engines_only and dp_rank > 0:
         assert not handshake_local_only
         local_handshake_address = get_open_zmq_ipc_path()
@@ -923,33 +947,30 @@ def launch_core_engines(
         local_handshake_address = handshake_address
         client_handshake_address = None
 
-    with zmq_socket_ctx(
-        local_handshake_address, zmq.ROUTER, bind=True
-    ) as handshake_socket:
-        from vllm.v1.engine.core import EngineCoreProc
+    from vllm.v1.engine.core import EngineCoreProc
 
-        # Start local engines.
-        if local_engine_count:
-            local_engine_manager = CoreEngineProcManager(
-                EngineCoreProc.run_engine_core,
-                vllm_config=vllm_config,
-                executor_class=executor_class,
-                log_stats=log_stats,
-                handshake_address=handshake_address,
-                client_handshake_address=client_handshake_address,
-                local_client=True,
-                local_engine_count=local_engine_count,
-                start_index=dp_rank,
-                local_start_index=local_start_index or 0,
-            )
-        else:
-            local_engine_manager = None
+    # Start local engines.
+    if local_engine_count:
+        local_engine_manager = CoreEngineProcManager(
+            EngineCoreProc.run_engine_core,
+            vllm_config=vllm_config,
+            executor_class=executor_class,
+            log_stats=log_stats,
+            handshake_address=handshake_address,
+            client_handshake_address=client_handshake_address,
+            local_client=True,
+            local_engine_count=local_engine_count,
+            start_index=dp_rank,
+            local_start_index=local_start_index or 0,
+        )
+    else:
+        local_engine_manager = None
 
-        yield local_engine_manager, coordinator, addresses
-
-        # Now wait for engines to start.
-        wait_for_engine_startup(
-            handshake_socket,
+    # For elastic EP with multiproc backend, use EngineRegistry for
+    # persistent handshake handling and scale-down event distribution.
+    if parallel_config.enable_elastic_ep:
+        registry = EngineRegistry(
+            local_handshake_address,
             addresses,
             engines_to_handshake,
             parallel_config,
@@ -958,6 +979,29 @@ def launch_core_engines(
             local_engine_manager,
             coordinator.proc if coordinator else None,
         )
+
+        yield local_engine_manager, coordinator, addresses
+
+        # Wait for engines to start via the registry.
+        registry.wait_for_engine_startup()
+    else:
+        # Original path: use zmq_socket_ctx for handshake
+        with zmq_socket_ctx(
+            local_handshake_address, zmq.ROUTER, bind=True
+        ) as handshake_socket:
+            yield local_engine_manager, coordinator, addresses
+
+            # Now wait for engines to start.
+            wait_for_engine_startup(
+                handshake_socket,
+                addresses,
+                engines_to_handshake,
+                parallel_config,
+                dp_size > 1 and vllm_config.model_config.is_moe,
+                vllm_config.cache_config,
+                local_engine_manager,
+                coordinator.proc if coordinator else None,
+            )
 
 
 def wait_for_engine_startup(
@@ -1101,6 +1145,405 @@ def wait_for_engine_startup(
 
             start_pending[0 if local else 1] -= 1
             engine.state = CoreEngineState.READY
+        else:
+            raise RuntimeError(
+                f"Unexpected {status} message for "
+                f"{'local' if local else 'remote'} engine "
+                f"{eng_index} in {engine.state} state."
+            )
+
+        logger.debug(
+            "%s from %s core engine process %s.",
+            status,
+            "local" if local else "remote",
+            eng_index,
+        )
+
+
+# Identity management for elastic EP scale-down with multiproc backend
+# The identity format uses specific bit patterns to distinguish between
+# different types of message senders (engine procs vs engine core clients).
+
+ENGINE_PROC_MGR_ID_PREFIX = b"epmgr"
+ENGINE_CORE_CLIENT_ID_PREFIX = b"ecli"
+
+
+def create_engine_proc_mgr_identity(start_dp_rank: int, local_dp_size: int) -> bytes:
+    """Construct engine process manager identity.
+
+    Args:
+        start_dp_rank: Starting DP rank managed by this process manager
+        local_dp_size: Number of local DP ranks managed by this process manager
+
+    Returns:
+        12-byte identity: prefix (4 bytes) + start_dp_rank (4 bytes) +
+        local_dp_size (4 bytes)
+    """
+    return (
+        ENGINE_PROC_MGR_ID_PREFIX
+        + start_dp_rank.to_bytes(4, "little")
+        + local_dp_size.to_bytes(4, "little")
+    )
+
+
+def check_engine_proc_mgr_identity(identity: bytes) -> bool:
+    """Check if the given identity belongs to an engine process manager."""
+    if identity is None or len(identity) != 12:
+        return False
+    return identity[:4] == ENGINE_PROC_MGR_ID_PREFIX
+
+
+def create_engine_core_client_identity(client_index: int) -> bytes:
+    """Construct engine core client identity.
+
+    Args:
+        client_index: Index of the client
+
+    Returns:
+        8-byte identity: prefix (4 bytes) + client_index (4 bytes)
+    """
+    return ENGINE_CORE_CLIENT_ID_PREFIX + client_index.to_bytes(4, "little")
+
+
+def check_engine_core_client_identity(identity: bytes) -> bool:
+    """Check if the given identity belongs to an engine core client."""
+    if identity is None or len(identity) != 8:
+        return False
+    return identity[:4] == ENGINE_CORE_CLIENT_ID_PREFIX
+
+
+class EngineRegistry:
+    """Manages engine handshake and proc-manager registration for elastic EP.
+
+    This class runs a persistent busy loop in a daemon thread that:
+    1. Handles initial engine startup handshake (HELLO/READY messages)
+    2. Registers engine process managers for tracking
+    3. Receives and forwards scale-down events to appropriate managers
+
+    For multiproc executor backend with elastic EP, this registry enables
+    controlled shutdown of engine processes during scale-down operations.
+    """
+
+    def __init__(
+        self,
+        handshake_address: str,
+        addresses: EngineZmqAddresses,
+        core_engines: list[CoreEngine],
+        parallel_config: ParallelConfig,
+        coordinated_dp: bool,
+        cache_config: CacheConfig,
+        proc_manager: CoreEngineProcManager | None,
+        coord_process: Process | None,
+    ):
+        self.handshake_address = handshake_address
+        self.addresses = addresses
+        self.core_engines = core_engines
+        self.parallel_config = parallel_config
+        self.coordinated_dp = coordinated_dp
+        self.cache_config = cache_config
+        self.proc_manager = proc_manager
+        self.coord_process = coord_process
+
+        self.handshake_socket = make_zmq_socket(
+            zmq.Context(), handshake_address, zmq.ROUTER, bind=True
+        )
+
+        self.identity_to_engine_proc_mgr: dict[bytes, EngineProcMgrMetadata] = {}
+
+        # Wait for engine core process(es) to send ready messages. These are
+        # initial values; conn_pending and start_pending are updated during
+        # scale up.
+        local_count = parallel_config.data_parallel_size_local
+        remote_count = len(core_engines) - local_count
+        # [local, remote] counts
+        self.conn_pending = [local_count, remote_count]
+        self.start_pending = [0, 0]
+        # Condition variables for synchronizing engine connections, startups,
+        # and scale-up operations.
+        self._conn_condition = threading.Condition()
+        self._start_condition = threading.Condition()
+
+        threading.Thread(target=self.run, name="EngineRegistry", daemon=True).start()
+
+    def run(self):
+        """Run the busy loop in a daemon thread."""
+        self._run_busy_loop(
+            self.handshake_socket,
+            self.addresses,
+            self.core_engines,
+            self.parallel_config,
+            self.coordinated_dp,
+            self.cache_config,
+            self.proc_manager,
+            self.coord_process,
+        )
+
+    def wait_for_engine_startup(self):
+        """Wait for all engines to complete startup handshake."""
+        with self._conn_condition:
+            while any(self.conn_pending):
+                self._conn_condition.wait()
+        with self._start_condition:
+            while any(self.start_pending):
+                self._start_condition.wait()
+
+    def notify_elastic_ep_event(self, cur_dp_size: int, new_dp_size: int):
+        """Notify engine process managers of elastic scaling events.
+
+        Sends scaling messages only to managers that have engines in the range
+        being removed. Updates tracking metadata for affected managers.
+
+        NOTE: Currently only supports scale down events.
+
+        Args:
+            cur_dp_size: Current data parallel size before scaling
+            new_dp_size: Target data parallel size after scaling
+        """
+        scale_message = msgspec.msgpack.encode(
+            {
+                "cur_data_parallel_size": cur_dp_size,
+                "new_data_parallel_size": new_dp_size,
+            }
+        )
+
+        identities_to_remove = []
+        for identity, eng_proc_mgr_meta in self.identity_to_engine_proc_mgr.items():
+            start_dp_rank = eng_proc_mgr_meta.start_dp_rank
+            local_dp_size = eng_proc_mgr_meta.local_dp_size
+            end_dp_rank = start_dp_rank + local_dp_size
+
+            # Skip managers whose engines are all below the target size
+            if end_dp_rank <= new_dp_size:
+                continue
+
+            # Send scale event message to this manager, and update tracking
+            self.handshake_socket.send_multipart((identity, scale_message), copy=False)
+            if start_dp_rank >= new_dp_size:
+                # All engines in this manager's range are removed
+                identities_to_remove.append(identity)
+            else:
+                # Partial removal: update remaining engine count
+                eng_proc_mgr_meta.local_dp_size = new_dp_size - start_dp_rank
+
+        # Remove fully scaled-down managers from tracking
+        for identity in identities_to_remove:
+            self.identity_to_engine_proc_mgr.pop(identity)
+
+    def _run_busy_loop(
+        self,
+        handshake_socket: zmq.Socket,
+        addresses: EngineZmqAddresses,
+        core_engines: list[CoreEngine],
+        parallel_config: ParallelConfig,
+        coordinated_dp: bool,
+        cache_config: CacheConfig,
+        proc_manager: CoreEngineProcManager | None,
+        coord_process: Process | None,
+    ):
+        """Main busy loop handling handshake and scaling messages."""
+        poller = zmq.Poller()
+        poller.register(handshake_socket, zmq.POLLIN)
+
+        remote_should_be_headless = (
+            not parallel_config.data_parallel_hybrid_lb
+            and not parallel_config.data_parallel_external_lb
+        )
+
+        if proc_manager is not None:
+            for sentinel in proc_manager.sentinels():
+                poller.register(sentinel, zmq.POLLIN)
+        if coord_process is not None:
+            poller.register(coord_process.sentinel, zmq.POLLIN)
+
+        while True:
+            events = poller.poll(STARTUP_POLL_PERIOD_MS)
+            if not events:
+                if any(self.conn_pending):
+                    logger.debug(
+                        "Waiting for %d local, %d remote core engine proc(s) "
+                        "to connect.",
+                        *self.conn_pending,
+                    )
+                if any(self.start_pending):
+                    logger.debug(
+                        "Waiting for %d local, %d remote core engine proc(s) to start.",
+                        *self.start_pending,
+                    )
+                continue
+
+            if len(events) > 1 or events[0][0] != handshake_socket:
+                # One of the local core processes exited.
+                finished = proc_manager.finished_procs() if proc_manager else {}
+                if coord_process is not None and coord_process.exitcode is not None:
+                    finished[coord_process.name] = coord_process.exitcode
+                if not finished:
+                    # This can happen if scale down removed the process whose
+                    # sentinel we were waiting on, so we should unregister the
+                    # sentinels for finished processes and just continue waiting
+                    # for other events.
+                    for event in events:
+                        poller.unregister(event[0])
+                    continue
+                raise RuntimeError(
+                    "Engine core initialization failed. "
+                    "See root cause above. "
+                    f"Failed core proc(s): {finished}"
+                )
+
+            # Receive messages from the input socket. These include:
+            # - HELLO/READY: engine process handshake and readiness signals
+            # - Registration messages from engine process managers
+            # - Scaling messages from the engine core client
+            eng_identity, ready_msg_bytes = handshake_socket.recv_multipart()
+
+            # If this message is from the engine client, it must be a scaling
+            # message to notify engine process managers of elastic scaling
+            # events.
+            if check_engine_core_client_identity(eng_identity):
+                msg = msgspec.msgpack.decode(ready_msg_bytes)
+                logger.debug("Received scaling message from engine client: %s", msg)
+                self.notify_elastic_ep_event(
+                    msg["cur_data_parallel_size"],
+                    msg["new_data_parallel_size"],
+                )
+                continue
+
+            # Check if this is a registration message from an engine process
+            # manager, which has a different format for the identity.
+            if check_engine_proc_mgr_identity(eng_identity):
+                msg = msgspec.msgpack.decode(ready_msg_bytes)
+                start_dp_rank, local_dp_size = (
+                    msg["start_dp_rank"],
+                    msg["local_dp_size"],
+                )
+                assert eng_identity not in self.identity_to_engine_proc_mgr, (
+                    f"Engine identity {eng_identity} already registered."
+                )
+                self.identity_to_engine_proc_mgr[eng_identity] = EngineProcMgrMetadata(
+                    start_dp_rank, local_dp_size
+                )
+                logger.debug(
+                    "Engine process manager registered with identity %s, "
+                    "start_dp_rank %d, local_dp_size %d",
+                    eng_identity,
+                    start_dp_rank,
+                    local_dp_size,
+                )
+                continue
+
+            # Handle HELLO/READY handshake messages from engine cores
+            self._handle_engine_handshake(
+                handshake_socket,
+                addresses,
+                core_engines,
+                parallel_config,
+                coordinated_dp,
+                cache_config,
+                eng_identity,
+                ready_msg_bytes,
+                remote_should_be_headless,
+            )
+
+    def _handle_engine_handshake(
+        self,
+        handshake_socket: zmq.Socket,
+        addresses: EngineZmqAddresses,
+        core_engines: list[CoreEngine],
+        parallel_config: ParallelConfig,
+        coordinated_dp: bool,
+        cache_config: CacheConfig,
+        eng_identity: bytes,
+        ready_msg_bytes: bytes,
+        remote_should_be_headless: bool,
+    ):
+        """Handle HELLO/READY handshake messages from engine cores."""
+        eng_index = int.from_bytes(eng_identity, "little")
+        engine = next((e for e in core_engines if e.identity == eng_identity), None)
+        if engine is None:
+            raise RuntimeError(
+                f"Message from engine with unexpected data parallel rank: {eng_index}"
+            )
+
+        msg = msgspec.msgpack.decode(ready_msg_bytes)
+        status, local, headless = msg["status"], msg["local"], msg["headless"]
+
+        if local != engine.local:
+            raise RuntimeError(
+                f"{status} message from "
+                f"{'local' if local else 'remote'} "
+                f"engine {eng_index}, expected it to be "
+                f"{'local' if engine.local else 'remote'}"
+            )
+
+        # Remote engines must be headless iff we aren't in hybrid dp lb mode.
+        if not local and headless != remote_should_be_headless:
+            if headless:
+                raise RuntimeError(
+                    f"Remote engine {eng_index} must not use "
+                    f"--headless in external or hybrid dp lb mode"
+                )
+            else:
+                raise RuntimeError(
+                    f"Remote engine {eng_index} must use "
+                    f"--headless unless in external or hybrid dp lb mode"
+                )
+
+        if status == "HELLO" and engine.state == CoreEngineState.NEW:
+            # Send connection metadata back to the engine.
+            init_message = msgspec.msgpack.encode(
+                EngineHandshakeMetadata(
+                    addresses=addresses,
+                    parallel_config={
+                        "data_parallel_size": parallel_config.data_parallel_size,
+                        "data_parallel_rank": eng_index,
+                    },
+                )
+            )
+            handshake_socket.send_multipart((eng_identity, init_message), copy=False)
+            self.conn_pending[0 if local else 1] -= 1
+            self.start_pending[0 if local else 1] += 1
+            engine.state = CoreEngineState.CONNECTED
+
+            with self._conn_condition:
+                self._conn_condition.notify_all()
+
+        elif status == "READY" and engine.state == CoreEngineState.CONNECTED:
+            # Setup KV cache config with initialization state from
+            # engine core process. Sum values from all engines in DP case.
+            num_gpu_blocks = cache_config.num_gpu_blocks or 0
+            num_gpu_blocks += msg["num_gpu_blocks"]
+            cache_config.num_gpu_blocks = num_gpu_blocks
+
+            # In external DP LB mode, the coordinator address that the
+            # front-end procs connect to is obtained from rank 0 via
+            # one of the engine handshakes, and passed to the local
+            # front-end process in the response from the other.
+            if addresses.frontend_stats_publish_address is None:
+                addresses.frontend_stats_publish_address = msg.get("dp_stats_address")
+
+            # Validate config hash consistency across DP workers for MoE models.
+            if coordinated_dp:
+                worker_config_hash = msg.get("parallel_config_hash")
+                expected_hash = parallel_config.compute_hash()
+                if worker_config_hash != expected_hash:
+                    raise RuntimeError(
+                        f"Configuration mismatch detected for engine "
+                        f"{eng_index}. All DP workers must have identical "
+                        f"configurations for parameters that affect collective "
+                        f"communication (e.g., enable_eplb, "
+                        f"eplb_config.log_balancedness). "
+                        f"Worker hash: {worker_config_hash}, "
+                        f"Expected hash: {expected_hash}. "
+                        f"Please ensure all workers are started with the same "
+                        f"command-line arguments."
+                    )
+
+            self.start_pending[0 if local else 1] -= 1
+            engine.state = CoreEngineState.READY
+
+            with self._start_condition:
+                self._start_condition.notify_all()
+
         else:
             raise RuntimeError(
                 f"Unexpected {status} message for "

@@ -56,6 +56,7 @@ from vllm.utils.system_utils import (
     set_process_title,
 )
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.engine import ReconfigureDistributedRequest
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
@@ -313,6 +314,21 @@ class MultiprocExecutor(Executor):
         return self.collective_rpc(
             "take_draft_token_ids", unique_reply_rank=self.output_rank
         )
+
+    def reinitialize_distributed(
+        self, reconfig_request: ReconfigureDistributedRequest
+    ) -> None:
+        """Reinitialize distributed environment for elastic EP scaling.
+
+        Broadcasts reinitialize_distributed call to all workers via collective_rpc.
+        This is used for elastic EP scale-down with multiproc backend.
+
+        Args:
+            reconfig_request: Request containing new distributed configuration
+        """
+        if self.rpc_broadcast_mq is None:
+            return
+        self.collective_rpc("reinitialize_distributed", args=(reconfig_request,))
 
     def collective_rpc(  # type: ignore[override]
         self,

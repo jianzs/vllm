@@ -48,6 +48,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.engine.utils import (
     CoreEngineActorManager,
     CoreEngineProcManager,
+    create_engine_core_client_identity,
     get_engine_zmq_addresses,
     launch_core_engines,
 )
@@ -576,6 +577,8 @@ class MPClient(EngineCoreClient):
                     self.resources.engine_manager = engine_manager
 
                 self.stats_update_address = addresses.frontend_stats_publish_address
+                # Save engine registry address for elastic EP scale-down
+                self.engine_registry_address = addresses.engine_registry_address
                 if coordinator is not None:
                     assert self.stats_update_address == (
                         coordinator.get_stats_publish_address()
@@ -1434,13 +1437,20 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             cache.num_new_core_engines
         ):
             if notification_type == EEPNotificationType.SHUTDOWN_COMPLETE:
-                assert isinstance(self.resources.engine_manager, CoreEngineActorManager)
                 assert cache.num_new_core_engines < 0
                 old_dp_size = len(cache.existing_core_engines)
                 new_dp_size = old_dp_size + cache.num_new_core_engines
-                self.resources.engine_manager.scale_down_elastic_ep(
-                    old_dp_size, new_dp_size
-                )
+                # Handle scale-down based on backend type
+                if self.vllm_config.parallel_config.data_parallel_backend == "ray":
+                    assert isinstance(
+                        self.resources.engine_manager, CoreEngineActorManager
+                    )
+                    self.resources.engine_manager.scale_down_elastic_ep(
+                        old_dp_size, new_dp_size
+                    )
+                else:
+                    # Multiproc backend: notify EngineRegistry
+                    self.notify_elastic_ep_event(old_dp_size, new_dp_size)
             else:
                 await asyncio.gather(
                     *[
@@ -1490,13 +1500,13 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             f"different from cur_data_parallel_size {cur_data_parallel_size}"
         )
 
-        assert self.vllm_config.parallel_config.data_parallel_backend == "ray", (
-            "Only ray DP backend supports scaling elastic EP"
-        )
-
         scale_up = new_data_parallel_size > cur_data_parallel_size
 
+        # Scale-up currently only supports ray backend (requires placement group)
         if scale_up:
+            assert self.vllm_config.parallel_config.data_parallel_backend == "ray", (
+                "Only ray DP backend supports scale up for elastic EP"
+            )
             await self._scale_up_elastic_ep(
                 cur_data_parallel_size, new_data_parallel_size
             )
@@ -1670,4 +1680,41 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         logger.info(
             "[Elastic EP] Scale down completed, new data parallel size: %s",
             new_data_parallel_size,
+        )
+
+    def notify_elastic_ep_event(self, cur_dp_size: int, new_dp_size: int):
+        """Notify EngineRegistry of elastic EP scaling events.
+
+        This method is used for multiproc executor backend to signal
+        scale-down events to the EngineRegistry, which will then notify
+        the appropriate engine process managers to shut down.
+
+        Args:
+            cur_dp_size: Current data parallel size before scaling
+            new_dp_size: Target data parallel size after scaling
+        """
+        assert self.engine_registry_address is not None, (
+            "Engine registry address should not be None when scaling down "
+            "elastic EP with non-ray DP backend"
+        )
+        with make_zmq_socket(
+            self.ctx,
+            self.engine_registry_address,
+            zmq.DEALER,
+            bind=False,
+            identity=create_engine_core_client_identity(self.client_index),
+            linger=5000,
+        ) as socket:
+            socket.send(
+                msgspec.msgpack.encode(
+                    {
+                        "cur_data_parallel_size": cur_dp_size,
+                        "new_data_parallel_size": new_dp_size,
+                    }
+                )
+            )
+        logger.debug(
+            "Notified EngineRegistry of elastic EP scale-down: %d -> %d",
+            cur_dp_size,
+            new_dp_size,
         )
