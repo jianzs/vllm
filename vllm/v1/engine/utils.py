@@ -938,6 +938,8 @@ def launch_core_engines(
     # Set engine registry address for elastic EP scale-down with multiproc
     if parallel_config.enable_elastic_ep:
         addresses.engine_registry_address = handshake_address
+        # Allocate ports for elastic EP stateless groups
+        parallel_config.allocate_elastic_ep_ports()
 
     if local_engines_only and dp_rank > 0:
         assert not handshake_local_only
