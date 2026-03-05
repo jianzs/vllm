@@ -3,6 +3,7 @@
 
 import os
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
@@ -45,6 +46,541 @@ All2AllBackend = Literal[
     "allgather_reducescatter",
     "flashinfer_all2allv",
 ]
+
+
+@dataclass
+class NodeInfo:
+    """Node information for topology discovery.
+
+    Describes the GPU configuration of a single physical node.
+    Used during topology discovery to build the complete cluster map.
+    """
+
+    device_count: int
+    """Number of GPUs visible to this node (via CUDA_VISIBLE_DEVICES).
+
+    This represents the total number of physical GPUs on this node.
+    """
+
+
+@dataclass
+class RankTopology:
+    """Describes the distribution of ranks across physical nodes.
+
+    This data structure eliminates the assumption that each node has the same
+    number of GPUs, enabling non-uniform distributions like:
+    - Node 1: 4 GPUs (ranks 0-3)
+    - Node 2: 2 GPUs (ranks 4-5)
+
+    The topology is discovered at runtime using StatelessProcessGroup to
+    coordinate between nodes.
+
+    Key concepts:
+    - device_count: Total GPUs on a node (physical hardware count)
+    - local_world_size: GPUs assigned to a specific DP rank on a node
+    """
+
+    rank_to_local_rank: dict[int, int]
+    """Mapping from global rank to local rank within the node."""
+
+    node_device_counts: list[int] = field(default_factory=list)
+    """List of device counts for each node, indexed by node_rank.
+
+    This represents the total number of GPUs on each physical node.
+    For example, [4, 2] means node 0 has 4 GPUs and node 1 has 2 GPUs.
+    """
+
+    @property
+    def world_size(self) -> int:
+        """Total number of GPUs across all nodes."""
+        return sum(self.node_device_counts)
+
+    def get_device_count_for_node_rank(self, node_rank: int) -> int:
+        """Get the total number of GPUs on a node.
+
+        This returns the physical GPU count on the node, regardless of
+        how they are distributed among DP replicas.
+
+        Args:
+            node_rank: The rank of the node (0-indexed).
+
+        Returns:
+            Total number of GPUs on the node.
+
+        Raises:
+            ValueError: If node_rank is invalid.
+        """
+        if node_rank < 0 or node_rank >= len(self.node_device_counts):
+            raise ValueError(
+                f"node_rank {node_rank} is out of range "
+                f"[0, {len(self.node_device_counts)})"
+            )
+        return self.node_device_counts[node_rank]
+
+    def get_global_start_rank_for_node_rank(self, node_rank: int) -> int:
+        """Get the starting global rank for a node identified by node_rank.
+
+        Args:
+            node_rank: The rank of the node (0-indexed).
+
+        Returns:
+            The starting global rank for the node.
+
+        Raises:
+            ValueError: If node_rank is invalid.
+        """
+        # Calculate the starting rank for this node_rank
+        start_rank = sum(self.node_device_counts[:node_rank])
+        return start_rank
+
+    def get_dp_start_rank_for_node_rank(
+        self, node_rank: int, pp_size: int = 1, tp_size: int = 1
+    ) -> int:
+        """Get the starting DP rank for a node.
+
+        This calculates the starting DP rank based on the actual rank distribution
+        in the topology, rather than assuming uniform distribution across nodes.
+
+        Args:
+            node_rank: The rank of the node (0-indexed).
+            pp_size: Pipeline parallel size. Defaults to 1.
+            tp_size: Tensor parallel size. Defaults to 1.
+
+        Returns:
+            The starting DP rank for the specified node.
+
+        Raises:
+            ValueError: If node_rank is invalid.
+
+        Example:
+            For a 2-node setup with 4 GPUs on node 0 and 2 GPUs on node 1:
+            >>> topology.get_dp_start_rank_for_node_rank(0, pp_size=1, tp_size=1)
+            0  # Node 0 contains global ranks 0-3, so DP ranks start at 0
+            >>> topology.get_dp_start_rank_for_node_rank(1, pp_size=1, tp_size=1)
+            4  # Node 1 contains global ranks 4-5, so DP ranks start at 4
+        """
+        # Validate node_rank
+        if node_rank < 0 or node_rank >= len(self.node_device_counts):
+            raise ValueError(
+                f"node_rank {node_rank} is out of range "
+                f"[0, {len(self.node_device_counts)})"
+            )
+
+        # Calculate the starting global rank for this node
+        start_global_rank = sum(self.node_device_counts[:node_rank])
+
+        # Each DP replica requires pp_size * tp_size ranks
+        world_size_within_dp = pp_size * tp_size
+
+        # The starting DP rank is the number of complete DP groups before this node
+        return start_global_rank // world_size_within_dp
+
+    def _get_dp_group_node_membership(
+        self, dp_rank: int, world_size_within_dp: int
+    ) -> list[int]:
+        """Get the list of node_ranks that contribute GPUs to a DP group.
+
+        A DP group consists of world_size_within_dp GPUs. This method determines
+        which nodes contribute GPUs to a specific DP group identified by dp_rank.
+
+        Args:
+            dp_rank: The DP rank to query.
+            world_size_within_dp: Number of GPUs per DP group (TP * PP).
+
+        Returns:
+            List of node_ranks that contribute GPUs to this DP group.
+        """
+        dp_start_gpu = dp_rank * world_size_within_dp
+        dp_end_gpu = dp_start_gpu + world_size_within_dp
+
+        member_nodes: list[int] = []
+        accumulated_gpus = 0
+
+        for node_rank, device_count in enumerate(self.node_device_counts):
+            node_start = accumulated_gpus
+            node_end = accumulated_gpus + device_count
+
+            # Check if this node overlaps with the DP group's GPU range
+            if node_end > dp_start_gpu and node_start < dp_end_gpu:
+                member_nodes.append(node_rank)
+
+            accumulated_gpus += device_count
+            if accumulated_gpus >= dp_end_gpu:
+                break
+
+        return member_nodes
+
+    def get_nnodes_within_dp(
+        self,
+        data_parallel_size: int,
+        dp_rank: int,
+    ) -> int:
+        """Get the number of nodes within a single DP replica.
+
+        For non-uniform distribution, different DP replicas may span different
+        numbers of nodes. This method calculates how many nodes a specific
+        DP replica spans.
+
+        Args:
+            data_parallel_size: Total number of DP replicas.
+            dp_rank: The DP rank to query.
+
+        Returns:
+            Number of nodes that the specified DP replica spans.
+
+        Raises:
+            ValueError: If data_parallel_size is invalid or dp_rank is out of range.
+
+        Example:
+            For 4+2 GPUs with TP=3, DP=2:
+            - DP 0: ranks 0,1,2 (all in node 0) → nnodes=1
+            - DP 1: ranks 3,4,5 (rank 3 in node 0, ranks 4,5 in node 1) → nnodes=2
+        """
+        if data_parallel_size <= 0:
+            raise ValueError(
+                f"data_parallel_size must be positive, got {data_parallel_size}"
+            )
+
+        if dp_rank < 0 or dp_rank >= data_parallel_size:
+            raise ValueError(
+                f"dp_rank {dp_rank} is out of range [0, {data_parallel_size})"
+            )
+
+        if len(self.node_device_counts) <= 1:
+            return 1
+
+        total_gpus = self.world_size
+        world_size_within_dp = total_gpus // data_parallel_size
+
+        if world_size_within_dp <= 0:
+            raise ValueError(
+                f"Invalid configuration: world_size ({total_gpus}) is smaller than "
+                f"data_parallel_size ({data_parallel_size})"
+            )
+
+        members = self._get_dp_group_node_membership(dp_rank, world_size_within_dp)
+        return max(1, len(members))
+
+    def get_node_rank_within_dp(
+        self,
+        node_rank: int,
+        dp_rank: int,
+        data_parallel_size: int,
+    ) -> int:
+        """Get the node's position within its DP replica.
+
+        This determines a node's position (0-indexed) within a DP group.
+        Position 0 means the node is the leader of that DP group.
+
+        Args:
+            node_rank: Global node rank (0-indexed).
+            dp_rank: The DP rank to query.
+            data_parallel_size: Total number of DP replicas.
+
+        Returns:
+            Node's position within its DP group (0 = leader).
+
+        Raises:
+            ValueError: If node_rank, dp_rank, or data_parallel_size is invalid.
+            ValueError: If the node does not belong to the specified DP group.
+
+        Example:
+            For 4+2 GPUs with TP=3, DP=2:
+            - Node 0: contains ranks 0-3
+                      DP 0 members: [node 0] -> node 0 position 0
+                      DP 1 members: [node 0, node 1] -> node 0 position 0
+            - Node 1: contains ranks 4-5
+                      DP 1 members: [node 0, node 1] -> node 1 position 1
+        """
+        # Calculate world_size_within_dp
+        world_size_within_dp = self.world_size // data_parallel_size
+        # Get the member nodes of this DP group
+        members = self._get_dp_group_node_membership(dp_rank, world_size_within_dp)
+        # Return the position of this node in the member list
+        assert node_rank in members, (
+            f"node_rank {node_rank} does not belong to DP group {dp_rank}. "
+            f"DP group {dp_rank} members: {members}"
+        )
+        return members.index(node_rank)
+
+    def get_local_world_size_for_dp_rank(
+        self,
+        node_rank: int,
+        dp_rank: int,
+        world_size_within_dp: int,
+    ) -> int:
+        """Get the number of GPUs this DP rank uses on this node.
+
+        This calculates how many GPUs a specific DP replica uses on a specific node.
+        The value is determined by the distribution constraints:
+
+        - Constraint 1: If device_count >= world_size_within_dp, each local DP replica
+          uses world_size_within_dp GPUs (the node hosts multiple complete DP replicas).
+        - Constraint 2: If device_count < world_size_within_dp, the node contributes
+          all its GPUs to a cross-node DP replica.
+
+        Args:
+            node_rank: Global node rank (0-indexed).
+            dp_rank: The DP rank to query.
+            world_size_within_dp: GPUs per DP replica (TP * PP).
+
+        Returns:
+            Number of GPUs this DP rank uses on this node.
+
+        Example:
+            For 4+2 GPUs with TP=1, DP=6 (MoE DP):
+            - world_size_within_dp = 1, each DP replica uses 1 GPU
+            - Node 0 (4 GPUs): DP 0-3 each use 1 GPU on this node
+            - Node 1 (2 GPUs): DP 4-5 each use 1 GPU on this node
+            - get_local_world_size_for_dp_rank(0, 0, 1) = 1
+            - get_local_world_size_for_dp_rank(0, 3, 1) = 1
+            - get_local_world_size_for_dp_rank(1, 4, 1) = 1
+
+            For 4+2 GPUs with TP=3, DP=2:
+            - world_size_within_dp = 3
+            - DP 0: uses ranks 0,1,2 (all in node 0) -> node 0 contributes 3 GPUs
+            - DP 1: uses ranks 3,4,5 (rank 3 in node 0, ranks 4,5 in node 1)
+              -> node 0 contributes 1 GPU, node 1 contributes 2 GPUs
+            - get_local_world_size_for_dp_rank(0, 0, 3) = 3
+            - get_local_world_size_for_dp_rank(0, 1, 3) = 1
+            - get_local_world_size_for_dp_rank(1, 1, 3) = 2
+        """
+        if node_rank < 0 or node_rank >= len(self.node_device_counts):
+            return 0
+
+        if world_size_within_dp <= 0:
+            return 0
+
+        # Calculate global GPU range for this DP replica
+        dp_start_gpu = dp_rank * world_size_within_dp
+        dp_end_gpu = dp_start_gpu + world_size_within_dp
+
+        # Calculate this node's GPU range
+        node_start_gpu = sum(self.node_device_counts[:node_rank])
+        node_end_gpu = node_start_gpu + self.node_device_counts[node_rank]
+
+        # Calculate overlap
+        overlap_start = max(dp_start_gpu, node_start_gpu)
+        overlap_end = min(dp_end_gpu, node_end_gpu)
+
+        return max(0, overlap_end - overlap_start)
+
+    def validate_distribution(self, world_size: int) -> None:
+        """Validate GPU distribution for a given world_size (TP * PP).
+
+        This validates that the GPU distribution across nodes satisfies the
+        constraints for non-uniform topology:
+
+        Constraint 1 (no cross-node DP replicas):
+            If a node has GPUs >= world_size, the GPU count must be divisible
+            by world_size. This ensures each DP replica on this node has
+            exactly world_size GPUs (TP * PP).
+
+        Constraint 2 (cross-node DP replicas):
+            If a node has GPUs < world_size, subsequent nodes must be included
+            until the accumulated GPU count exactly equals world_size. This
+            ensures cross-node DP replicas have exactly world_size GPUs total.
+
+        Args:
+            world_size: The size of a single DP replica (TP * PP).
+
+        Raises:
+            ValueError: If the distribution violates the constraints.
+        """
+        if world_size <= 0:
+            raise ValueError(f"world_size must be positive, got {world_size}")
+
+        device_counts = self.node_device_counts
+        node_idx = 0
+        nnodes = len(device_counts)
+
+        # Edge case: empty distribution
+        if nnodes == 0:
+            raise ValueError("Empty GPU distribution. At least one node is required.")
+
+        while node_idx < nnodes:
+            gpus = device_counts[node_idx]
+
+            if gpus >= world_size:
+                # Constraint 1: GPU count must divide world_size
+                if gpus % world_size != 0:
+                    raise ValueError(
+                        f"Node {node_idx} has {gpus} GPUs (>= world_size "
+                        f"{world_size}), but {gpus} is not divisible by {world_size}. "
+                        "Each node with GPUs >= world_size must have GPUs "
+                        "divisible by world_size to host complete DP replicas."
+                    )
+                node_idx += 1
+            else:
+                # Constraint 2: Accumulate GPUs until exactly world_size
+                accumulated = 0
+                start_idx = node_idx
+
+                while node_idx < nnodes and accumulated < world_size:
+                    accumulated += device_counts[node_idx]
+                    node_idx += 1
+
+                if accumulated != world_size:
+                    remaining = device_counts[start_idx:]
+                    raise ValueError(
+                        f"Starting from node {start_idx}, accumulated "
+                        f"{accumulated} GPUs but world_size is {world_size}. "
+                        f"Cross-node DP replica requires exactly world_size "
+                        f"GPUs. GPU distribution: {device_counts}, "
+                        f"nodes: {remaining}"
+                    )
+
+    @classmethod
+    def from_node_infos(cls, node_infos: list[NodeInfo]) -> "RankTopology":
+        """Build topology from a list of node information.
+
+        Args:
+            node_infos: List of NodeInfo objects, one per node.
+                       The order in the list determines global rank assignment
+                       and node_rank (index 0 = node_rank 0, etc.).
+
+        Returns:
+            A RankTopology instance describing the complete distribution.
+
+        Example:
+            For 2 nodes with 4 and 2 GPUs respectively:
+            >>> node_infos = [
+            ...     NodeInfo(device_count=4),
+            ...     NodeInfo(device_count=2),
+            ... ]
+            >>> topology = RankTopology.from_node_infos(node_infos)
+            >>> topology.world_size
+            6
+            >>> topology.get_global_start_rank_for_node_rank(0)
+            0
+            >>> topology.get_global_start_rank_for_node_rank(1)
+            4
+        """
+        rank_to_local_rank: dict[int, int] = {}
+        node_device_counts: list[int] = []
+
+        current_global_rank = 0
+        for node_info in node_infos:
+            node_device_counts.append(node_info.device_count)
+
+            for local_rank in range(node_info.device_count):
+                global_rank = current_global_rank + local_rank
+                rank_to_local_rank[global_rank] = local_rank
+
+            current_global_rank += node_info.device_count
+
+        return cls(
+            rank_to_local_rank=rank_to_local_rank,
+            node_device_counts=node_device_counts,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize RankTopology to a dictionary for inter-process communication."""
+        return {
+            "rank_to_local_rank": self.rank_to_local_rank,
+            "node_device_counts": self.node_device_counts,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RankTopology":
+        """Deserialize RankTopology from a dictionary."""
+        return cls(
+            rank_to_local_rank=data["rank_to_local_rank"],
+            node_device_counts=data["node_device_counts"],
+        )
+
+
+def discover_rank_topology(
+    nnodes: int,
+    node_rank: int,
+    master_addr: str,
+    master_port: int,
+    coord_port_offset: int = 1000,
+) -> RankTopology:
+    """Discover rank topology across nodes before ParallelConfig is constructed.
+
+    This function gathers GPU count information from all nodes and builds a
+    RankTopology. It can be called during engine config creation to enable
+    accurate configuration inference for non-uniform GPU distributions.
+
+    For single-node deployments, builds topology from local GPU count only.
+    For multi-node deployments, uses StatelessProcessGroup to coordinate.
+
+    Args:
+        nnodes: Number of nodes in the cluster.
+        node_rank: Rank of this node (0-indexed).
+        master_addr: Address of the master node for coordination.
+        master_port: Port of the master node.
+        coord_port_offset: Port offset for topology coordination.
+            The actual coordination port is master_port + coord_port_offset.
+
+    Returns:
+        RankTopology describing the distribution of ranks across nodes.
+
+    Raises:
+        AssertionError: If the number of node infos gathered doesn't match nnodes.
+    """
+    from vllm.distributed.utils import StatelessProcessGroup
+    from vllm.utils.network_utils import get_ip
+
+    local_ip = get_ip()
+    local_gpu_count = current_platform.device_count()
+
+    if nnodes <= 1:
+        # Single node: build topology from local info only
+        node_infos = [NodeInfo(device_count=local_gpu_count)]
+        logger.debug(
+            "Single node deployment, topology built with %d GPUs",
+            local_gpu_count,
+        )
+        return RankTopology.from_node_infos(node_infos)
+
+    # Multi-node: coordinate via StatelessProcessGroup
+    # Use fixed port offset (not dependent on dp_rank, which is not yet known)
+    coord_port = master_port + coord_port_offset
+    logger.info(
+        "Discovering topology with %d nodes, node_rank=%d, coord_port=%d",
+        nnodes,
+        node_rank,
+        coord_port,
+    )
+
+    coord_group = StatelessProcessGroup.create(
+        host=master_addr,
+        port=coord_port,
+        rank=node_rank,
+        world_size=nnodes,
+    )
+
+    local_info = NodeInfo(device_count=local_gpu_count)
+
+    logger.debug(
+        "Node %d (%s) has %d visible GPUs",
+        node_rank,
+        local_ip,
+        local_gpu_count,
+    )
+
+    # All-gather node infos from all nodes
+    all_infos = coord_group.all_gather_obj(local_info)
+
+    # Type narrow - all_infos should be fully populated after all_gather
+    node_infos = [info for info in all_infos if info is not None]
+    assert len(node_infos) == nnodes, (
+        f"Expected {nnodes} node infos, got {len(node_infos)}"
+    )
+
+    # Build topology
+    topology = RankTopology.from_node_infos(node_infos)
+
+    logger.info(
+        "Topology discovery complete. World size: %d, Node rank %d has %d GPUs",
+        topology.world_size,
+        node_rank,
+        topology.get_device_count_for_node_rank(node_rank),
+    )
+
+    return topology
 
 
 @config
@@ -325,6 +861,18 @@ class ParallelConfig:
         should only be set by API server scale-out.
     """
 
+    _rank_topology: RankTopology | None = Field(default=None)
+    """
+    Runtime topology describing rank distribution across physical nodes.
+
+    This is set during engine config creation (create_engine_config) for both
+    single-node and multi-node deployments with MP backend, enabling non-uniform
+    GPU distributions across nodes (e.g., node 1 with 4 GPUs, node 2 with 2 GPUs).
+
+    Note:
+        This is an internal config set at runtime, not by user configuration.
+    """
+
     @field_validator("disable_nccl_for_dp_synchronization", mode="wrap")
     @classmethod
     def _skip_none_validation(cls, value: Any, handler: Callable) -> Any:
@@ -558,20 +1106,126 @@ class ParallelConfig:
 
     @property
     def node_rank_within_dp(self) -> int:
-        return self.node_rank % self.nnodes_within_dp
+        """Get the node rank within its DP replica.
+
+        Requires topology information to be available for accurate results,
+        especially in non-uniform distribution scenarios.
+
+        For single-node deployments, returns 0.
+        For multi-node deployments, requires _rank_topology to be set during
+        engine config creation.
+
+        Returns:
+            Node rank within the DP replica (0-indexed).
+
+        Raises:
+            RuntimeError: If topology is required but not initialized.
+        """
+        if self.nnodes == 1:
+            return 0
+
+        assert self._rank_topology is not None, (
+            "RankTopology not initialized for multi-node deployment. "
+            "This property requires topology information which should be "
+            "discovered during engine config creation."
+        )
+
+        # Calculate dp_rank for this node
+        dp_rank = self._rank_topology.get_dp_start_rank_for_node_rank(
+            self.node_rank,
+            self.pipeline_parallel_size,
+            self.tensor_parallel_size,
+        )
+        return self._rank_topology.get_node_rank_within_dp(
+            self.node_rank,
+            dp_rank,
+            self.data_parallel_size,
+        )
 
     @property
     def nnodes_within_dp(self) -> int:
+        """Get the number of nodes within a single DP replica.
+
+        Requires topology information for accurate results in non-uniform
+        distribution scenarios.
+
+        For single-node deployments, returns 1.
+        For multi-node deployments, requires _rank_topology to be set.
+
+        Returns:
+            Number of nodes within a single DP replica.
+
+        Raises:
+            RuntimeError: If topology is required but not initialized.
+        """
         if self.nnodes == 1:
             return 1
-        data_parallel_node_size = (
-            self.data_parallel_size // self.data_parallel_size_local
+
+        assert self._rank_topology is not None, (
+            "RankTopology not initialized for multi-node deployment. "
+            "This property requires topology information which should be "
+            "discovered during engine config creation."
         )
-        return self.nnodes // data_parallel_node_size
+
+        # Calculate dp_rank for this node
+        dp_rank = self._rank_topology.get_dp_start_rank_for_node_rank(
+            self.node_rank,
+            self.pipeline_parallel_size,
+            self.tensor_parallel_size,
+        )
+        return self._rank_topology.get_nnodes_within_dp(
+            self.data_parallel_size, dp_rank
+        )
 
     @property
     def local_world_size(self) -> int:
-        return self.world_size // self.nnodes_within_dp
+        """Get the number of GPUs for this DP rank on this node.
+
+        This is the number of GPUs that this specific DP replica uses on the
+        current node. In MoE DP scenarios (world_size=1), each DP replica
+        typically uses 1 GPU per node it spans.
+
+        For TP/PP scenarios without DP, this equals the node's total GPU count.
+
+        Returns:
+            Number of GPUs for this DP rank on this node.
+
+        Raises:
+            RuntimeError: If topology is required but not initialized for
+                multi-node deployments.
+        """
+        assert self._rank_topology is not None, (
+            "RankTopology not initialized for multi-node deployment. "
+            "This property requires topology information which should be "
+            "discovered during engine config creation."
+        )
+        # Use DP-aware local world size calculation
+        # world_size_within_dp = TP * PP (GPUs per DP replica)
+        world_size_within_dp = self.tensor_parallel_size * self.pipeline_parallel_size
+        return self._rank_topology.get_local_world_size_for_dp_rank(
+            self.node_rank,
+            self.data_parallel_rank,
+            world_size_within_dp,
+        )
+
+    @property
+    def data_parallel_start_rank(self) -> int:
+        """The starting DP rank for this node.
+
+        For multi-node deployments with non-uniform topology, this returns
+        the actual starting DP rank based on RankTopology. For single-node
+        or uniform deployments, falls back to 0.
+        """
+        assert self._rank_topology is not None, (
+            "RankTopology not initialized for multi-node deployment. "
+            "This property requires topology information which should be "
+            "discovered during engine config creation."
+        )
+        return self._rank_topology.get_dp_start_rank_for_node_rank(
+            self.node_rank,
+            pp_size=self.pipeline_parallel_size,
+            tp_size=self.tensor_parallel_size,
+        )
 
     @staticmethod
     def has_unfinished_dp(dp_group: ProcessGroup, has_unfinished: bool) -> bool:
@@ -634,6 +1288,7 @@ class ParallelConfig:
             "worker_extension_cls",
             "_api_process_count",
             "_api_process_rank",
+            "_rank_topology",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors

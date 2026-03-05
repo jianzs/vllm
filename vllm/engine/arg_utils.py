@@ -434,6 +434,7 @@ class EngineArgs:
     )
     _api_process_count: int = ParallelConfig._api_process_count
     _api_process_rank: int = ParallelConfig._api_process_rank
+    _rank_topology_data: dict[str, Any] | None = None
     max_parallel_loading_workers: int | None = (
         ParallelConfig.max_parallel_loading_workers
     )
@@ -1558,37 +1559,64 @@ class EngineArgs:
         assert self.data_parallel_backend == "mp" or self.nnodes == 1, (
             "nnodes > 1 is only supported with data_parallel_backend=mp"
         )
+
+        world_size_within_dp = self.pipeline_parallel_size * self.tensor_parallel_size
+
+        # For multi-node MP backend, discover topology early to enable
+        # accurate configuration inference for non-uniform distributions
+        # Note: Skip topology discovery for API server scale-out child processes
+        # to avoid port conflicts - topology is discovered by parent process.
+        # A process is an API server child if:
+        # - _api_process_count > 1 (scale-out is enabled) AND
+        # - _api_process_rank >= 0 (is a child process, not the main process with -1)
+        topology = None
+        if self.data_parallel_backend == "mp":
+            is_api_server_child = (
+                self._api_process_count > 1 and self._api_process_rank >= 0
+            )
+            if not is_api_server_child:
+                # Main process performs topology discovery
+                from vllm.config.parallel import discover_rank_topology
+
+                topology = discover_rank_topology(
+                    nnodes=self.nnodes,
+                    node_rank=self.node_rank,
+                    master_addr=self.master_addr,
+                    master_port=self.master_port,
+                )
+                topology.validate_distribution(world_size_within_dp)
+            else:
+                # API server child process: restore topology from parent process
+                # data Single-node deployments may not need topology, so
+                # _rank_topology_data can be None
+                assert self._rank_topology_data is not None
+                from vllm.config.parallel import RankTopology
+
+                topology = RankTopology.from_dict(self._rank_topology_data)
+
         inferred_data_parallel_rank = 0
         if self.nnodes > 1:
-            world_size = (
-                self.data_parallel_size
-                * self.pipeline_parallel_size
-                * self.tensor_parallel_size
+            assert topology is not None, (
+                "RankTopology is required for multi-node deployments when "
+                "distributed_executor_backend is mp."
             )
-            world_size_within_dp = (
-                self.pipeline_parallel_size * self.tensor_parallel_size
+            inferred_data_parallel_rank = topology.get_dp_start_rank_for_node_rank(
+                self.node_rank,
+                pp_size=self.pipeline_parallel_size,
+                tp_size=self.tensor_parallel_size,
             )
-            local_world_size = world_size // self.nnodes
-            assert world_size % self.nnodes == 0, (
-                f"world_size={world_size} must be divisible by nnodes={self.nnodes}."
-            )
-            assert self.node_rank < self.nnodes, (
-                f"node_rank={self.node_rank} must be less than nnodes={self.nnodes}."
-            )
-            inferred_data_parallel_rank = (
-                self.node_rank * local_world_size
-            ) // world_size_within_dp
+
             if self.data_parallel_size > 1 and self.data_parallel_external_lb:
                 self.data_parallel_rank = inferred_data_parallel_rank
                 logger.info(
-                    "Inferred data_parallel_rank %d from node_rank %d for external lb",
+                    "Inferred data_parallel_rank %d from topology for node_rank %d",
                     self.data_parallel_rank,
                     self.node_rank,
                 )
             elif self.data_parallel_size_local is None:
                 # Infer data parallel size local for internal dplb:
                 self.data_parallel_size_local = max(
-                    local_world_size // world_size_within_dp, 1
+                    current_platform.device_count() // world_size_within_dp, 1
                 )
         data_parallel_external_lb = (
             self.data_parallel_external_lb or self.data_parallel_rank is not None
@@ -1724,6 +1752,7 @@ class EngineArgs:
             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             _api_process_count=self._api_process_count,
             _api_process_rank=self._api_process_rank,
+            _rank_topology=topology,
         )
 
         speculative_config = self.create_speculative_config(

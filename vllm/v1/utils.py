@@ -32,6 +32,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 if TYPE_CHECKING:
     import numpy as np
 
+    from vllm.config.parallel import RankTopology
     from vllm.v1.engine.coordinator import DPCoordinator
     from vllm.v1.engine.utils import CoreEngineActorManager, CoreEngineProcManager
 
@@ -173,6 +174,7 @@ class APIServerProcessManager:
         input_addresses: list[str],
         output_addresses: list[str],
         stats_update_address: str | None = None,
+        rank_topology: "RankTopology | None" = None,
     ):
         """Initialize and start API server worker processes.
 
@@ -185,6 +187,7 @@ class APIServerProcessManager:
             input_addresses: Input addresses for each API server
             output_addresses: Output addresses for each API server
             stats_update_address: Optional stats update address
+            rank_topology: Optional topology to pass to child processes
         """
         self.listen_address = listen_address
         self.sock = sock
@@ -205,6 +208,9 @@ class APIServerProcessManager:
             }
             if stats_update_address is not None:
                 client_config["stats_update_address"] = stats_update_address
+            # Pass topology data to child processes for multi-node deployments
+            if rank_topology is not None:
+                client_config["rank_topology"] = rank_topology.to_dict()
 
             proc = spawn_context.Process(
                 target=target_server_fn,

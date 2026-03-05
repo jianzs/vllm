@@ -89,6 +89,10 @@ async def build_async_engine_client(
     if client_config:
         engine_args._api_process_count = client_config.get("client_count", 1)
         engine_args._api_process_rank = client_config.get("client_index", 0)
+        # Pass topology data from parent process for multi-node deployments
+        rank_topology_data = client_config.get("rank_topology")
+        if rank_topology_data is not None:
+            engine_args._rank_topology_data = rank_topology_data
 
     if disable_frontend_multiprocessing is None:
         disable_frontend_multiprocessing = bool(args.disable_frontend_multiprocessing)

@@ -13,11 +13,11 @@ import os
 from tests.utils import multi_gpu_test
 from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
-from vllm.utils import get_open_port
+from vllm.utils.network_utils import get_open_port
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
-MODEL = "facebook/opt-125m"
+MODEL = os.environ.get("VLLM_TEST_MODEL", "facebook/opt-125m")
 
 
 def create_vllm_config(
@@ -31,6 +31,8 @@ def create_vllm_config(
     master_port: int = 0,
 ) -> VllmConfig:
     """Create a VllmConfig for testing using EngineArgs."""
+    from vllm.config.parallel import NodeInfo, RankTopology
+
     engine_args = EngineArgs(
         model=MODEL,
         tensor_parallel_size=tensor_parallel_size,
@@ -47,6 +49,15 @@ def create_vllm_config(
         vllm_config.parallel_config.nnodes = nnodes
         vllm_config.parallel_config.node_rank = node_rank
         vllm_config.parallel_config.master_port = master_port
+
+        # For multi-node tests, create a uniform topology (equal GPUs per node)
+        # This simulates a typical multi-node deployment for testing
+        world_size = tensor_parallel_size * pipeline_parallel_size
+        gpus_per_node = world_size // nnodes
+        node_infos = [NodeInfo(device_count=gpus_per_node) for _ in range(nnodes)]
+        topology = RankTopology.from_node_infos(node_infos)
+        vllm_config.parallel_config._rank_topology = topology
+
     if nnodes > 1:
         vllm_config.parallel_config.disable_custom_all_reduce = True
 

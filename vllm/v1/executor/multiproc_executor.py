@@ -107,6 +107,16 @@ class MultiprocExecutor(Executor):
         self.shutdown_event = threading.Event()
         self.failure_callback: FailureCallback | None = None
 
+        # Topology should already be discovered during engine config creation
+        # for both single-node and multi-node deployments with MP backend. This
+        # must be done before _get_parallel_sizes which needs topology.
+        topology = self.parallel_config._rank_topology
+        assert topology is not None, (
+            "RankTopology not initialized. "
+            "This should have been done during engine config creation. "
+            "Ensure discover_rank_topology() is called when creating engine config."
+        )
+
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
         assert self.world_size == tp_size * pp_size * pcp_size, (
             f"world_size ({self.world_size}) must be equal to the "
@@ -155,8 +165,11 @@ class MultiprocExecutor(Executor):
         unready_workers: list[UnreadyWorkerProcHandle] = []
         success = False
         try:
+            # Get topology-aware rank assignments for this node
+            node_rank = self.parallel_config.node_rank
             global_start_rank = (
-                self.local_world_size * self.parallel_config.node_rank_within_dp
+                topology.get_global_start_rank_for_node_rank(node_rank)
+                % self.world_size
             )
             for local_rank in range(self.local_world_size):
                 global_rank = global_start_rank + local_rank
@@ -226,11 +239,6 @@ class MultiprocExecutor(Executor):
 
     def _get_parallel_sizes(self) -> tuple[int, int, int]:
         self.world_size = self.parallel_config.world_size
-        assert self.world_size % self.parallel_config.nnodes_within_dp == 0, (
-            f"global world_size ({self.parallel_config.world_size}) must be "
-            f"divisible by nnodes_within_dp "
-            f"({self.parallel_config.nnodes_within_dp}). "
-        )
         self.local_world_size = self.parallel_config.local_world_size
         tp_size = self.parallel_config.tensor_parallel_size
         pp_size = self.parallel_config.pipeline_parallel_size
@@ -586,7 +594,6 @@ class WorkerProc:
         )
 
         # Load model
-        self._init_message_queues(input_shm_handle, vllm_config)
         is_eep_new_worker = envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
         if not is_eep_new_worker:
             self.worker.init_device()
@@ -595,6 +602,10 @@ class WorkerProc:
                 enable_ep=vllm_config.parallel_config.enable_expert_parallel
             )
             self.worker.load_model()
+
+        # Initialize message queues after parallel groups are initialized
+        # (needed for nnodes_within_dp > 1 which requires get_inner_dp_world_group)
+        self._init_message_queues(input_shm_handle, vllm_config)
 
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
