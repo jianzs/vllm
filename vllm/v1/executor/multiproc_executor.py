@@ -56,7 +56,7 @@ from vllm.utils.system_utils import (
     set_process_title,
 )
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.engine import ReconfigureDistributedRequest
+from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
@@ -328,7 +328,26 @@ class MultiprocExecutor(Executor):
         """
         if self.rpc_broadcast_mq is None:
             return
-        self.collective_rpc("reinitialize_distributed", args=(reconfig_request,))
+
+        is_shutdown = (
+            reconfig_request.new_data_parallel_rank
+            == ReconfigureRankType.SHUTDOWN_CURRENT_RANK
+        )
+
+        try:
+            self.collective_rpc("reinitialize_distributed", args=(reconfig_request,))
+        except RuntimeError:
+            # Workers may exit during scale-down before sending response.
+            # This is expected for shutdown case.
+            if is_shutdown:
+                logger.info("Workers exited during scale-down (expected)")
+            else:
+                raise
+
+        # For shutdown case, trigger graceful worker termination.
+        # Workers will exit via death_pipe notification when parent exits.
+        if is_shutdown:
+            self.shutdown()
 
     def collective_rpc(  # type: ignore[override]
         self,

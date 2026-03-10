@@ -241,6 +241,9 @@ class ElasticEPScalingExecutor:
 
     def switch_and_remove(self) -> None:
         _replace_active_groups(world=None, dp=None, ep=None, eplb=None, node_count=None)
+        # Worker process will exit when the EngineCore (parent) process exits.
+        # The executor shuts down via death_pipe notification, triggering
+        # graceful worker termination through _ensure_worker_termination().
 
     def switch_and_prepare(self) -> None:
         old_dp_size = get_dp_group().world_size

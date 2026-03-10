@@ -393,7 +393,13 @@ class ElasticEPScalingState:
                 EEPNotificationType.SHUTDOWN_COMPLETE
             )
             self.engine_core.shutdown()
-            return True
+            # For multiproc backend, the EngineCore process must exit
+            # explicitly after shutdown. The busy loop doesn't have a
+            # mechanism to break out. Using sys.exit() allows cleanup
+            # (finally blocks, atexit handlers) unlike os._exit().
+            import sys
+
+            sys.exit(0)
 
         else:
             assert self.state == ScaleDownRemovingEngineState.COMPLETE

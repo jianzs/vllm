@@ -682,10 +682,20 @@ class MPClient(EngineCoreClient):
             _self = self_ref()
             if not _self or _self.resources.engine_dead:
                 return
-            _self.resources.engine_dead = True
-            proc_name = next(
-                proc.name for proc in engine_processes if proc.sentinel == died[0]
+            # Check if process has been removed from engine_manager.processes
+            # (expected during scale-down). If still tracked, it's unexpected.
+            # Only CoreEngineProcManager has .processes attribute.
+            engine_mgr = _self.resources.engine_manager
+            if not isinstance(engine_mgr, CoreEngineProcManager):
+                return
+            died_proc = next(
+                (p for p in engine_mgr.processes if p.sentinel == died[0]), None
             )
+            if died_proc is None:
+                # Process was removed, likely due to scale-down completion
+                return
+            proc_name = died_proc.name
+            _self.resources.engine_dead = True
             logger.error(
                 "Engine core proc %s died unexpectedly, shutting down client.",
                 proc_name,
@@ -1627,6 +1637,13 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         reconfiguring existing engine cores."""
         cur_data_parallel_size = len(self.core_engines)
 
+        # For multiproc backend, notify EngineRegistry about expected exits
+        # BEFORE the engines start exiting. This must happen early to avoid
+        # race conditions where the EngineRegistry detects the exit before
+        # processing the scaling message.
+        if self.vllm_config.parallel_config.data_parallel_backend != "ray":
+            self.notify_elastic_ep_event(cur_data_parallel_size, new_data_parallel_size)
+
         self.eep_scaling_cache = ElasticScalingCache(
             existing_core_engines=self.core_engines.copy(),
             num_new_core_engines=new_data_parallel_size - cur_data_parallel_size,
@@ -1665,6 +1682,16 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         wait_future = self._eep_wait_for_setup_switch_complete()
 
         await asyncio.gather(*reconfig_futures)
+
+        # For multiproc backend, update the process list after scale-down
+        # to remove processes that have been shut down. This prevents the
+        # monitor thread from detecting them as unexpected exits.
+        if self.vllm_config.parallel_config.data_parallel_backend != "ray":
+            engine_mgr = self.resources.engine_manager
+            if isinstance(engine_mgr, CoreEngineProcManager):
+                engine_mgr.scale_down_elastic_ep(
+                    cur_data_parallel_size, new_data_parallel_size
+                )
 
         self.vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
         self._ensure_stats_update_task()
@@ -1713,7 +1740,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     }
                 )
             )
-        logger.debug(
+        logger.info(
             "Notified EngineRegistry of elastic EP scale-down: %d -> %d",
             cur_dp_size,
             new_dp_size,

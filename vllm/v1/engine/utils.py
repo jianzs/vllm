@@ -192,6 +192,32 @@ class CoreEngineProcManager:
             if proc.exitcode is not None
         }
 
+    def scale_down_elastic_ep(
+        self, cur_dp_size: int, new_dp_size: int
+    ) -> list[BaseProcess]:
+        """Remove processes for scaled-down engines.
+
+        Returns the list of removed processes (for waiting on their exit).
+        """
+        removed_procs = []
+        # Collect processes to remove (those with DP rank >= new_dp_size)
+        remaining_procs = []
+        for proc in self.processes:
+            # Extract DP rank from process name "EngineCore_DP{rank}"
+            name = proc.name
+            if name.startswith("EngineCore_DP"):
+                dp_rank = int(name.split("DP")[1])
+                if dp_rank >= new_dp_size:
+                    removed_procs.append(proc)
+                else:
+                    remaining_procs.append(proc)
+            else:
+                remaining_procs.append(proc)
+
+        # Update processes list to only include remaining processes
+        self.processes = remaining_procs
+        return removed_procs
+
 
 @contextlib.contextmanager
 def set_device_control_env_var(
@@ -1252,6 +1278,9 @@ class EngineRegistry:
 
         self.identity_to_engine_proc_mgr: dict[bytes, EngineProcMgrMetadata] = {}
 
+        # Track process names expected to exit during scale-down
+        self._expected_exits: set[str] = set()
+
         # Wait for engine core process(es) to send ready messages. These are
         # initial values; conn_pending and start_pending are updated during
         # scale up.
@@ -1301,6 +1330,11 @@ class EngineRegistry:
             cur_dp_size: Current data parallel size before scaling
             new_dp_size: Target data parallel size after scaling
         """
+        # Track expected process exits for local EngineCore processes
+        # Process names follow the pattern "EngineCore_DP{rank}"
+        for dp_rank in range(new_dp_size, cur_dp_size):
+            self._expected_exits.add(f"EngineCore_DP{dp_rank}")
+
         scale_message = msgspec.msgpack.encode(
             {
                 "cur_data_parallel_size": cur_dp_size,
@@ -1373,78 +1407,103 @@ class EngineRegistry:
                     )
                 continue
 
-            if len(events) > 1 or events[0][0] != handshake_socket:
+            # CRITICAL: Process handshake_socket messages FIRST to update
+            # _expected_exits before checking process exits. This prevents
+            # race conditions during scale-down where both a scaling message
+            # and process exit events arrive simultaneously.
+            has_socket_event = any(e[0] == handshake_socket for e in events)
+            if has_socket_event:
+                # Process all pending messages from handshake_socket
+                while True:
+                    try:
+                        eng_identity, ready_msg_bytes = handshake_socket.recv_multipart(
+                            zmq.NOBLOCK
+                        )
+                    except zmq.Again:
+                        break
+
+                    # If this message is from the engine client, it must be a
+                    # scaling message to notify engine process managers of
+                    # elastic scaling events.
+                    if check_engine_core_client_identity(eng_identity):
+                        msg = msgspec.msgpack.decode(ready_msg_bytes)
+                        logger.debug(
+                            "Received scaling message from engine client: %s", msg
+                        )
+                        self.notify_elastic_ep_event(
+                            msg["cur_data_parallel_size"],
+                            msg["new_data_parallel_size"],
+                        )
+                        continue
+
+                    # Check if this is a registration message from an engine
+                    # process manager, which has a different format for identity.
+                    if check_engine_proc_mgr_identity(eng_identity):
+                        msg = msgspec.msgpack.decode(ready_msg_bytes)
+                        start_dp_rank, local_dp_size = (
+                            msg["start_dp_rank"],
+                            msg["local_dp_size"],
+                        )
+                        assert eng_identity not in self.identity_to_engine_proc_mgr, (
+                            f"Engine identity {eng_identity} already registered."
+                        )
+                        self.identity_to_engine_proc_mgr[eng_identity] = (
+                            EngineProcMgrMetadata(start_dp_rank, local_dp_size)
+                        )
+                        logger.debug(
+                            "Engine process manager registered with identity %s, "
+                            "start_dp_rank %d, local_dp_size %d",
+                            eng_identity,
+                            start_dp_rank,
+                            local_dp_size,
+                        )
+                        continue
+
+                    # Handle HELLO/READY handshake messages from engine cores
+                    self._handle_engine_handshake(
+                        handshake_socket,
+                        addresses,
+                        core_engines,
+                        parallel_config,
+                        coordinated_dp,
+                        cache_config,
+                        eng_identity,
+                        ready_msg_bytes,
+                        remote_should_be_headless,
+                    )
+
+            # Now check for process exits AFTER processing messages.
+            # This ensures _expected_exits is updated before we check.
+            if any(e[0] != handshake_socket for e in events):
                 # One of the local core processes exited.
                 finished = proc_manager.finished_procs() if proc_manager else {}
                 if coord_process is not None and coord_process.exitcode is not None:
                     finished[coord_process.name] = coord_process.exitcode
-                if not finished:
-                    # This can happen if scale down removed the process whose
-                    # sentinel we were waiting on, so we should unregister the
-                    # sentinels for finished processes and just continue waiting
-                    # for other events.
+
+                # Filter out expected exits (from scale-down)
+                unexpected_exits = {
+                    name: code
+                    for name, code in finished.items()
+                    if name not in self._expected_exits
+                }
+                # Remove expected exits from tracking since they've exited
+                self._expected_exits -= finished.keys()
+
+                if not unexpected_exits:
+                    # All exits were expected (scale-down) or no exits.
+                    # Unregister sentinels for finished processes and continue.
                     for event in events:
-                        poller.unregister(event[0])
+                        if event[0] != handshake_socket:
+                            poller.unregister(event[0])
                     continue
                 raise RuntimeError(
                     "Engine core initialization failed. "
                     "See root cause above. "
-                    f"Failed core proc(s): {finished}"
+                    f"Failed core proc(s): {unexpected_exits}"
                 )
 
-            # Receive messages from the input socket. These include:
-            # - HELLO/READY: engine process handshake and readiness signals
-            # - Registration messages from engine process managers
-            # - Scaling messages from the engine core client
-            eng_identity, ready_msg_bytes = handshake_socket.recv_multipart()
-
-            # If this message is from the engine client, it must be a scaling
-            # message to notify engine process managers of elastic scaling
-            # events.
-            if check_engine_core_client_identity(eng_identity):
-                msg = msgspec.msgpack.decode(ready_msg_bytes)
-                logger.debug("Received scaling message from engine client: %s", msg)
-                self.notify_elastic_ep_event(
-                    msg["cur_data_parallel_size"],
-                    msg["new_data_parallel_size"],
-                )
-                continue
-
-            # Check if this is a registration message from an engine process
-            # manager, which has a different format for the identity.
-            if check_engine_proc_mgr_identity(eng_identity):
-                msg = msgspec.msgpack.decode(ready_msg_bytes)
-                start_dp_rank, local_dp_size = (
-                    msg["start_dp_rank"],
-                    msg["local_dp_size"],
-                )
-                assert eng_identity not in self.identity_to_engine_proc_mgr, (
-                    f"Engine identity {eng_identity} already registered."
-                )
-                self.identity_to_engine_proc_mgr[eng_identity] = EngineProcMgrMetadata(
-                    start_dp_rank, local_dp_size
-                )
-                logger.debug(
-                    "Engine process manager registered with identity %s, "
-                    "start_dp_rank %d, local_dp_size %d",
-                    eng_identity,
-                    start_dp_rank,
-                    local_dp_size,
-                )
-                continue
-
-            # Handle HELLO/READY handshake messages from engine cores
-            self._handle_engine_handshake(
-                handshake_socket,
-                addresses,
-                core_engines,
-                parallel_config,
-                coordinated_dp,
-                cache_config,
-                eng_identity,
-                ready_msg_bytes,
-                remote_should_be_headless,
-            )
+            # If only socket event and no process exits, continue to next iteration
+            continue
 
     def _handle_engine_handshake(
         self,
