@@ -571,7 +571,7 @@ class Worker(WorkerBase):
         self, grammar_outputs: "GrammarOutput | None | list[GrammarOutput | True]"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         if isinstance(grammar_outputs, list):
-            grammar_output = grammar_outputs[self.model_runner.cp_rank]
+            grammar_output = grammar_outputs[self.model_runner.dycp_rank]
             if grammar_output is True:
                 return False
         else:
@@ -583,7 +583,7 @@ class Worker(WorkerBase):
         self, scheduler_outputs: "SchedulerOutput | list[SchedulerOutput | None]"
     ) -> ModelRunnerOutput | None:
         if isinstance(scheduler_outputs, list):
-            scheduler_output = scheduler_outputs[self.model_runner.cp_rank]
+            scheduler_output = scheduler_outputs[self.model_runner.dycp_rank]
             if scheduler_output.total_num_scheduled_tokens == 0 and not scheduler_output.none_tokens_in_peer_sched:
                 self.model_runner._dummy_run(1, uniform_decode=True)
         else:
