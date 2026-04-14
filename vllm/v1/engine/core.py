@@ -139,6 +139,12 @@ class EngineCore:
                 logger.warning("Disabling chunked prefill for model without KVCache")
                 vllm_config.scheduler_config.enable_chunked_prefill = False
 
+        # NOTE: dp_per_domain (DyCP) is NOT included here.
+        # DyCP uses CrossDPScheduler which manages per-rank block pools
+        # independently with the original spec block_size. Unlike DCP/PCP
+        # where all requests share a uniform "virtual block", DyCP mixes
+        # CP requests (cross-rank) and DP requests (single-rank), so a
+        # single multiplied block_size cannot represent both correctly.
         scheduler_block_size = (
             vllm_config.cache_config.block_size
             * vllm_config.parallel_config.decode_context_parallel_size
@@ -1166,6 +1172,11 @@ class EngineCoreProc(EngineCore):
             )
         elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:
             raise RuntimeError("Executor failed.")
+        elif request_type == EngineCoreRequestType.START_DP_WAVE:
+            # Non-DP cores may still receive this control message through shared
+            # paths; treat it as a no-op here. DP-specific behavior is handled
+            # in DPEngineCoreProc._handle_client_request.
+            return
         else:
             logger.error(
                 "Unrecognized input request type encountered: %s", request_type
