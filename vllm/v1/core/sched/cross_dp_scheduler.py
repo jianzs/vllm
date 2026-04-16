@@ -177,7 +177,7 @@ class CrossDPScheduler(Scheduler):
         assert self.max_cp_tokens >= self.graph_size_for_cp, "max_cp_tokens should be greater than or equal to graph_size_for_cp"
         # Request queue control the token threshold for long requests.
         self.waiting = LongShortRequestQueue(
-            long_request_threshold=1 * 1024,
+            long_request_threshold=128 * 1024,
             max_long_requests=self.max_cp_tokens,
         )
         self.request_manager = RequestManager(
@@ -544,16 +544,42 @@ class CrossDPScheduler(Scheduler):
         rank_budgets = [self.max_num_scheduled_tokens] * self.cp_world_size
 
         def _get_effective_budget(cp_ranks: list[int]) -> int:
-            """Return the max tokens a request on *cp_ranks* can schedule."""
+            """Return the max tokens a request on *cp_ranks* can schedule.
+
+            For CP requests, the budget must account for DualChunkSwap
+            alignment in PCP: tokens are padded to a multiple of
+            ``2 * cp_size`` then divided by ``cp_size``, giving a per-rank
+            cost of ``ceil(T / (2 * W)) * 2``.  The inverse is
+            ``(min_budget // 2) * 2 * W``.  We still allow at least 1 token
+            (decode) when the budget is positive.
+            """
             cp_size = len(cp_ranks)
             if cp_size > 1:
-                return min(rank_budgets[r] for r in cp_ranks) * cp_size
+                min_budget = min(rank_budgets[r] for r in cp_ranks)
+                if min_budget <= 0:
+                    return 0
+                # Max total tokens whose DualChunkSwap per-rank cost fits
+                # within min_budget; guarantee at least 1 for decode.
+                return max((min_budget // 2) * 2 * cp_size, 1)
             return rank_budgets[cp_ranks[0]]
 
         def _deduct_budget(cp_ranks: list[int], num_tokens: int) -> None:
-            """Deduct per-rank cost from *rank_budgets* in-place."""
+            """Deduct per-rank cost from *rank_budgets* in-place.
+
+            For CP prefill (cp_size > 1, num_tokens > 1), use the same
+            DualChunkSwap-aligned formula as
+            PCPManager.update_tokens_for_pcp():
+            ``per_rank_cost = ceil(num_tokens / (2 * cp_size)) * 2``.
+
+            For CP decode (num_tokens == 1) the token is duplicated across
+            ranks, so each rank processes exactly 1 token.
+            """
             cp_size = len(cp_ranks)
-            per_rank_cost = (num_tokens + cp_size - 1) // cp_size
+            if cp_size > 1 and num_tokens > 1:
+                per_rank_cost = (
+                    (num_tokens + 2 * cp_size - 1) // (2 * cp_size)) * 2
+            else:
+                per_rank_cost = num_tokens
             for r in cp_ranks:
                 rank_budgets[r] -= per_rank_cost
 
@@ -937,7 +963,12 @@ class CrossDPScheduler(Scheduler):
             effective_rank_tokens = 0
             for req_id, tokens in num_scheduled_tokens[idx].items():
                 cp_size = cp_rank_scheduled_tokens[idx].get(req_id, 1)
-                effective_rank_tokens += (tokens + cp_size - 1) // cp_size
+                if cp_size > 1 and tokens > 1:
+                    # DualChunkSwap alignment (must match _deduct_budget).
+                    effective_rank_tokens += (
+                        (tokens + 2 * cp_size - 1) // (2 * cp_size)) * 2
+                else:
+                    effective_rank_tokens += tokens
             assert effective_rank_tokens <= self.max_num_scheduled_tokens, (
                 f"rank {idx} effective tokens {effective_rank_tokens} "
                 f"> {self.max_num_scheduled_tokens}"
