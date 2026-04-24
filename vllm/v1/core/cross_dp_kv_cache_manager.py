@@ -340,9 +340,10 @@ class CrossDPKVCacheManager:
                 - The number of computed tokens.
         """
 
-        if not self.enable_caching or request.skip_reading_prefix_cache:
-            return self.empty_kv_cache_blocks, 0
-        
+        # CrossDP KV cache manager does not support prefix caching,
+        # so always return empty blocks regardless of enable_caching.
+        return self.empty_kv_cache_blocks, 0
+
     def allocate_slots(
         self,
         cp_ranks: list[int],
@@ -420,9 +421,9 @@ class CrossDPKVCacheManager:
         
         assert len(new_blocks) == len(cp_ranks), "the size of new_blocks should be equal to size of cp_ranks"
 
-        if not self.enable_caching or delay_cache_blocks:
-            # This condition is always true in this version
-            return self.create_kv_cache_blocks(new_blocks)
+        # Prefix caching save path not yet implemented for CrossDP,
+        # always return newly allocated blocks.
+        return self.create_kv_cache_blocks(new_blocks)
 
 
     def free(self, request: Request) -> None:

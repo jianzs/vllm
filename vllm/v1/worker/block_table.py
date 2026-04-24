@@ -207,6 +207,21 @@ class BlockTable:
             )
 
     def compute_domain_slot_mapping(self, req_indices: np.ndarray, positions: np.ndarray, num_dycp_reqs: int = 0) -> None:
+        # Fast path: all DP requests, no DyCP
+        if num_dycp_reqs == 0:
+            block_table_indices = (
+                req_indices * self.max_num_blocks_per_req
+                + positions // self.block_size
+            )
+            block_numbers = self.block_table.np.ravel()[block_table_indices]
+            block_offsets = positions % self.block_size
+            np.add(
+                block_numbers * self.block_size,
+                block_offsets,
+                out=self.slot_mapping.np[:req_indices.shape[0]],
+            )
+            return
+
         # Split requests into dycp (dcp) and dp groups
         # req_indices < num_dycp_reqs: use dcp calculation
         # req_indices >= num_dycp_reqs: use dp calculation

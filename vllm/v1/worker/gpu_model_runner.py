@@ -1952,7 +1952,7 @@ class GPUModelRunner(
                     : num_tokens * self.pcp_world_size
                 ]
 
-        elif self.dycp_world_size > 1:
+        elif self.dycp_world_size > 1 and num_dycp_reqs > 0:
             # pcp_allgather_restore_idx is only needed when PCP token
             # splitting was used (DyCP prefill). Pure decode has
             # num_dycp_tokens == num_dycp_reqs (1 token per request).

@@ -715,7 +715,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 self.dcp_rank,
                 self.dcp_kv_cache_interleave_size,
             )
-        if self.dycp_world_size > 1:
+        if self.dycp_world_size > 1 and common_attn_metadata.num_dycp_reqs > 0:
             num_dycp_reqs = common_attn_metadata.num_dycp_reqs
             seq_lens_cpu[:num_dycp_reqs] = get_cp_local_seq_lens(
                 seq_lens_cpu[:num_dycp_reqs],
