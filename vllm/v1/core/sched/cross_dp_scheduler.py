@@ -1,5 +1,6 @@
 from ast import Set
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -176,8 +177,11 @@ class CrossDPScheduler(Scheduler):
         self.graph_size_for_cp = self.vllm_config.compilation_config.cudagraph_capture_sizes_for_cp
         assert self.max_cp_tokens >= self.graph_size_for_cp, "max_cp_tokens should be greater than or equal to graph_size_for_cp"
         # Request queue control the token threshold for long requests.
+        _thresh = int(os.environ.get("VLLM_LONG_REQUEST_THRESHOLD",
+                                     128 * 1024))
+        logger.info("CrossDPScheduler: long_request_threshold=%d", _thresh)
         self.waiting = LongShortRequestQueue(
-            long_request_threshold=128 * 1024,
+            long_request_threshold=_thresh,
             max_long_requests=self.max_cp_tokens,
         )
         self.request_manager = RequestManager(
@@ -228,7 +232,13 @@ class CrossDPScheduler(Scheduler):
         2. the request manager should be updated.
         3. the has_slot_for_long_request should be updated.
         """
-        self.waiting.running_long_count -= 1 if self.waiting.is_long_request(request) else 0
+        # PD decode requests are classified as short (CP=1) at schedule time,
+        # so they must also be classified as short at free time to keep
+        # running_long_count consistent.
+        kv_params = request.kv_transfer_params
+        is_long = (self.waiting.is_long_request(request)
+                   and not (kv_params and kv_params.get("do_remote_prefill")))
+        self.waiting.running_long_count -= 1 if is_long else 0
         self.request_manager.free_req(request)
         self.waiting.has_slot_for_long_request = self.request_manager.has_slot_for_long_request()
 
@@ -248,6 +258,30 @@ class CrossDPScheduler(Scheduler):
 
     def has_finished_requests(self) -> bool:
         return sum(len(sub_ids) for sub_ids in self.finished_req_ids) > 0
+
+    def _update_from_kv_xfer_finished(self, kv_connector_output):
+        """Override to handle multi-rank deduplication.
+
+        With multiple CP ranks, the same finished_sending req_id may
+        arrive from multiple workers across scheduling steps. Guard
+        against double-free by checking self.requests before freeing.
+        """
+        if self.connector is not None:
+            self.connector.bind_connector_metadata(None)
+
+        for req_id in kv_connector_output.finished_recving or ():
+            logger.debug("Finished recving KV transfer for request %s",
+                         req_id)
+            self.finished_recving_kv_req_ids.add(req_id)
+        for req_id in kv_connector_output.finished_sending or ():
+            if req_id in self.requests:
+                logger.debug(
+                    "Finished sending KV transfer for request %s", req_id)
+                self._free_blocks(self.requests[req_id])
+            else:
+                logger.debug(
+                    "Skipping finished_sending for already-freed %s",
+                    req_id)
 
     def _connector_finished(
         self, request: Request
@@ -269,7 +303,7 @@ class CrossDPScheduler(Scheduler):
             # Hybrid memory allocator should be already turned off for this
             # code path, but let's double-check here.
             assert len(self.kv_cache_config.kv_cache_groups) == 1
-            return self.connector.request_finished(request, block_ids[0])
+            return self.connector.request_finished(request, block_ids)
 
         return self.connector.request_finished_all_groups(request, block_ids)
     
@@ -592,6 +626,7 @@ class CrossDPScheduler(Scheduler):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and max(rank_budgets) > 0:
@@ -624,8 +659,8 @@ class CrossDPScheduler(Scheduler):
             """
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens,
-                                _get_effective_budget(request.cp_ranks))
+            eff_budget = _get_effective_budget(request.cp_ranks)
+            num_new_tokens = min(num_new_tokens, eff_budget)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -680,7 +715,10 @@ class CrossDPScheduler(Scheduler):
                         TODO(AoChen): Preempted request is also need to be removed from the request manager.
                         """
                         self.request_manager.free_req(preempted_req)
-                        self.waiting.running_long_count -= 1 if self.waiting.is_long_request(preempted_req) else 0
+                        _kv_params = preempted_req.kv_transfer_params
+                        _is_long = (self.waiting.is_long_request(preempted_req)
+                                    and not (_kv_params and _kv_params.get("do_remote_prefill")))
+                        self.waiting.running_long_count -= 1 if _is_long else 0
                         self.waiting.has_slot_for_long_request = self.request_manager.has_slot_for_long_request()
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
@@ -727,6 +765,12 @@ class CrossDPScheduler(Scheduler):
                     break
 
                 is_long = self.waiting.is_long_request(request)
+
+                # PD decode requests always use CP=1 (single rank)
+                kv_params = request.kv_transfer_params
+                if kv_params and kv_params.get("do_remote_prefill"):
+                    is_long = False
+
                 if len(request.cp_ranks) == 0:
                     selected_dp = self.request_manager.select_dp(
                         request, is_long,
@@ -922,7 +966,7 @@ class CrossDPScheduler(Scheduler):
                 self._update_connector_prefix_cache_stats(request)
                 
                 self.running.append(request)
-                self.waiting.running_long_count += 1 if self.waiting.is_long_request(request) else 0
+                self.waiting.running_long_count += 1 if is_long else 0
                 self.request_manager.add_req(request)
                 self.waiting.has_slot_for_long_request = self.request_manager.has_slot_for_long_request()
 
