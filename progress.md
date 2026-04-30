@@ -1,6 +1,6 @@
 # DyCP Progress
 
-## 当前状态：P1 实现阶段（完成）
+## 当前状态：P2 实现阶段（完成）
 
 ### 已完成 (P0) ✓
 
@@ -67,14 +67,13 @@
 
 ### 未完成 (P2 剩余)
 
-- `vllm/attention/ops/common.py` — `CPTritonContext` 字典化（按 cp_size 索引 triton context）
-- `cp_local_seq_lens` per-request 化（当前使用固定 dycp_world_size，decode 中不同 cp_size 请求共存时需要 per-request 值）
+- 无（P2 全部完成）
 
 ## 下一步
 
-1. **P2 剩余**: `vllm/attention/ops/common.py` — `CPTritonContext` 字典化
-2. **P2 剩余**: `cp_local_seq_lens` per-request 化
-3. **测试**: 同步到远程机器，运行端到端测试验证 DyCP 功能
+1. **测试**: 同步到远程机器，运行端到端测试验证 DyCP 功能
+2. **验证**: 测试混合 cp_size 场景（同一批次中不同请求有不同 cp_size 的 KV layout）
+3. **性能**: 按测试标准跑 benchmark，对比 DP baseline
 
 ## 发现的问题
 
@@ -87,19 +86,10 @@
 - 确认 P0 层（config、scheduler、parallel_state）已基本完成
 - 识别出剩余 P0 工作：cross_dp_kv_cache_manager 硬约束
 
-### 2026-04-30 Session 2
-- 确认所有 P0 工作已完成（7 个文件的修改均已到位）
-- cross_dp_kv_cache_manager.py 硬约束已替换为 power-of-2 + factor 校验
-- 提交 P0 commit
-- 完成 P1 工作：
-  - block_table.py: per-request interleave，支持 per_req_cp_sizes 向量化计算
-  - cp_utils.py: PCPManager 新增 effective_pcp_world_size 参数，运行时推导 pcp_rank
-  - gpu_model_runner.py: 构建 per_req_cp_sizes_np 传给 block_table，actual_cp_size 传给 PCPManager
-- 提交 P1 commit
-- 完成 P2 主要工作：
-  - MLA attention: decode/prefill 路径使用 get_dycp_subgroup(cp_size) 替代 get_dycp_group()
-  - CommonAttentionMetadata + MLACommonMetadata: 新增 actual_cp_size 字段，从 scheduler 传递到 attention
-  - BatchDescriptor: 新增 cp_size 字段（CUDA graph 第 3 维 key）
-  - cudagraph_dispatcher: 3D graph key 生成 + 剪枝（cp_tokens=0→cp_size=1, cp_tokens>0→cp_size>1）
-  - gpu_model_runner: 传递 actual_cp_size 到 dispatcher 和 attention，capture loop 使用 4-tuple
-- 提交 P2 commit
+### 2026-04-30 Session 3
+- 完成 P2 剩余工作：
+  - `vllm/attention/ops/common.py`: CPTritonContext 字典化，内部用 dict 按 const_args 组合索引编译后的 kernel，支持不同 cp_size（不同 N_ROUNDED）复用同一 context 而不触发重编译
+  - `vllm/v1/attention/backends/utils.py`: `get_cp_local_seq_lens` 支持 per-request cp_world_size tensor 参数，当传入 tensor 时按 `dycp_rank % cp_world_size[i]` 推导 per-request cp_rank
+  - `vllm/v1/worker/gpu_model_runner.py`: 存储 `_per_req_cp_sizes_np`，在 `_build_attention_metadata` 中用 per-request cp_sizes 计算 cp_local_seq_lens
+- P2 全部完成
+- 下一步：同步到远程机器，运行端到端测试验证 DyCP 功能

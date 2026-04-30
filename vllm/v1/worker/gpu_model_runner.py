@@ -326,6 +326,7 @@ class GPUModelRunner(
         self.cp_world_size = self.dcp_world_size * self.pcp_world_size
         self.dycp_world_size = self.parallel_config.dp_per_domain
         self.dycp_rank = 0 if self.dycp_world_size <= 1 else get_dycp_group().rank_in_group
+        self._per_req_cp_sizes_np: "np.ndarray | None" = None
         if self.dycp_world_size > 1:
             self.cp_world_size = self.dycp_world_size
             self.cp_rank = self.dycp_rank
@@ -1636,6 +1637,7 @@ class GPUModelRunner(
                         per_req_cp_sizes_np[req_idx] = (
                             scheduler_output.per_req_cp_sizes[req_id]
                         )
+            self._per_req_cp_sizes_np = per_req_cp_sizes_np
             self.input_batch.block_table.compute_domain_slot_mapping(
                 req_indices, positions_np,
                 scheduler_output.num_cp_request,
@@ -1928,12 +1930,24 @@ class GPUModelRunner(
             actual_cp_size=scheduler_output.actual_cp_size,
         )
         if self.dycp_world_size > 1 and num_dycp_reqs > 0:
-            self.cp_local_seq_lens.cpu[:num_dycp_reqs] = get_cp_local_seq_lens(
-                self.seq_lens.cpu[:num_dycp_reqs],
-                self.dycp_world_size,
-                self.dycp_rank,
-                self.parallel_config.cp_kv_cache_interleave_size,
-            )
+            per_req_cp_sizes_np = self._per_req_cp_sizes_np
+            if per_req_cp_sizes_np is not None and num_dycp_reqs <= len(per_req_cp_sizes_np):
+                cp_ws_tensor = torch.from_numpy(
+                    per_req_cp_sizes_np[:num_dycp_reqs]
+                ).to(torch.int32)
+                self.cp_local_seq_lens.cpu[:num_dycp_reqs] = get_cp_local_seq_lens(
+                    self.seq_lens.cpu[:num_dycp_reqs],
+                    cp_ws_tensor,
+                    self.dycp_rank,
+                    self.parallel_config.cp_kv_cache_interleave_size,
+                )
+            else:
+                self.cp_local_seq_lens.cpu[:num_dycp_reqs] = get_cp_local_seq_lens(
+                    self.seq_lens.cpu[:num_dycp_reqs],
+                    self.dycp_world_size,
+                    self.dycp_rank,
+                    self.parallel_config.cp_kv_cache_interleave_size,
+                )
             self.cp_local_seq_lens.cpu[num_dycp_reqs:num_reqs].copy_(self.seq_lens.cpu[num_dycp_reqs:num_reqs])
             self.cp_local_seq_lens.cpu[num_reqs:].fill_(0)
             self.cp_local_seq_lens.copy_to_gpu(num_reqs_padded)

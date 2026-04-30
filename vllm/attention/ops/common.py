@@ -95,16 +95,23 @@ def _correct_attn_cp_out_kernel(
 
 
 class CPTritonContext:
-    """The CPTritonContext is used to avoid recompilation of the Triton JIT."""
+    """The CPTritonContext is used to avoid recompilation of the Triton JIT.
+
+    Under DyCP, different cp_sizes produce different N_ROUNDED (a Triton
+    constexpr), requiring separate compiled kernels.  This class indexes
+    compiled kernels by a hashable key derived from const_args so that
+    switching between cp_sizes does not trigger recompilation.
+    """
 
     def __init__(self):
-        self.inner_kernel = None
+        self._kernels: dict[tuple, object] = {}
 
     def call_kernel(self, kernel, grid, *regular_args, **const_args):
-        if self.inner_kernel is None:
-            self.inner_kernel = kernel[grid](*regular_args, **const_args)
+        key = tuple(sorted(const_args.items()))
+        if key not in self._kernels:
+            self._kernels[key] = kernel[grid](*regular_args, **const_args)
         else:
-            self.inner_kernel[grid](*regular_args)
+            self._kernels[key][grid](*regular_args)
 
 
 def correct_attn_out(
