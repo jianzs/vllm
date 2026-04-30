@@ -41,7 +41,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
-from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue, LongShortRequestQueue
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue, LongShortRequestQueue, get_cp_size_for_request
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -76,6 +76,7 @@ class RequestManager:
         request: Request,
         is_long: bool,
         rank_budgets: list[int] | None = None,
+        cp_size: int = 0,
     ) -> list[int] | None:
         if len(request.cp_ranks) > 0:
             if all([self.num_req_per_dp[rank] < self.max_num_seqs for rank in request.cp_ranks]):
@@ -83,14 +84,28 @@ class RequestManager:
             else:
                 return None
 
-        if is_long:
+        if cp_size > 1:
+            # DyCP: select aligned rank subset of size cp_size.
+            # Ranks must start at multiples of cp_size.
+            best_group = None
+            best_min_reqs = float('inf')
+            for start in range(0, self.cp_world_size, cp_size):
+                group = list(range(start, start + cp_size))
+                if not all(self.num_req_per_dp[r] < self.max_num_seqs for r in group):
+                    continue
+                if rank_budgets is not None and not all(rank_budgets[r] > 0 for r in group):
+                    continue
+                max_reqs = max(self.num_req_per_dp[r] for r in group)
+                if max_reqs < best_min_reqs:
+                    best_min_reqs = max_reqs
+                    best_group = group
+            return best_group
+        elif is_long:
             return [
                 i for i in range(self.cp_world_size)
             ]
         else:
             if rank_budgets is not None:
-                # Pick the rank with available seq slot AND most remaining
-                # token budget so that per-rank utilisation stays balanced.
                 candidates = [
                     i for i in range(self.cp_world_size)
                     if self.num_req_per_dp[i] < self.max_num_seqs
@@ -100,7 +115,6 @@ class RequestManager:
                     return None
                 best_dp = max(candidates, key=lambda i: rank_budgets[i])
             else:
-                # Fallback: pick rank with fewest requests.
                 best_dp = min(range(len(self.num_req_per_dp)),
                               key=lambda i: self.num_req_per_dp[i])
             return [best_dp]
@@ -187,6 +201,13 @@ class CrossDPScheduler(Scheduler):
         self.request_manager = RequestManager(
             cp_world_size=self.cp_world_size,
             max_num_seqs=self.max_num_running_reqs,
+        )
+
+        # DyCP: threshold-based dynamic CP size
+        self.dycp_enabled = vllm_config.parallel_config.dycp_enabled
+        self.dycp_sorted_thresholds = (
+            vllm_config.parallel_config.dycp_sorted_thresholds
+            if self.dycp_enabled else []
         )
 
     def _update_after_schedule(
@@ -572,6 +593,9 @@ class CrossDPScheduler(Scheduler):
         num_scheduled_tokens: list[dict[str, int]] = [{} for _ in range(self.cp_world_size)]
         cp_rank_scheduled_tokens: list[dict[str, int]] = [{} for _ in range(self.cp_world_size)]
 
+        # DyCP: track per-request cp_size for the output
+        per_req_cp_sizes: dict[str, int] = {}
+
         # Per-rank token budgets: each rank can process up to
         # max_num_scheduled_tokens.  CP requests split tokens across ranks,
         # so their per-rank cost is num_tokens / cp_size.
@@ -745,7 +769,11 @@ class CrossDPScheduler(Scheduler):
                 req_to_new_blocks[rank][request.request_id] = new_blocks[i]
                 num_scheduled_tokens[rank][request.request_id] = num_new_tokens
                 cp_rank_scheduled_tokens[rank][request.request_id] = len(request.cp_ranks)
-            
+
+            # DyCP: record cp_size for running requests
+            if self.dycp_enabled:
+                per_req_cp_sizes[request.request_id] = len(request.cp_ranks)
+
             _deduct_budget(request.cp_ranks, num_new_tokens)
             req_index += 1
 
@@ -771,15 +799,25 @@ class CrossDPScheduler(Scheduler):
                 if kv_params and kv_params.get("do_remote_prefill"):
                     is_long = False
 
+                # DyCP: determine cp_size from thresholds
+                req_cp_size = 1
+                if self.dycp_enabled:
+                    num_prompt_tokens = request.num_tokens - request.num_output_tokens
+                    req_cp_size = get_cp_size_for_request(
+                        num_prompt_tokens, self.dycp_sorted_thresholds
+                    )
+
                 if len(request.cp_ranks) == 0:
                     selected_dp = self.request_manager.select_dp(
                         request, is_long,
                         rank_budgets=rank_budgets,
+                        cp_size=req_cp_size if self.dycp_enabled else 0,
                     )
                 else:
                     selected_dp = self.request_manager.select_dp(
                         request, is_long,
                         rank_budgets=rank_budgets,
+                        cp_size=req_cp_size if self.dycp_enabled else 0,
                     )
                 if selected_dp is None:
                     break
@@ -937,6 +975,7 @@ class CrossDPScheduler(Scheduler):
                 # This information is used to determine if a load is
                 # needed for this request.
                 request.cp_ranks = selected_dp
+                per_req_cp_sizes[request.request_id] = req_cp_size
 
                 """
                 TODO(AoChen): update_state_after_alloc(PD disagg) is not implemented yet.
@@ -1071,6 +1110,9 @@ class CrossDPScheduler(Scheduler):
 
         none_tokens_in_peer_sched = all([sum(num_scheduled_tokens[idx].values()) == 0 for idx in range(self.cp_world_size)])
 
+        # DyCP: compute batch-level actual_cp_size (max across all scheduled reqs)
+        actual_cp_size = max(per_req_cp_sizes.values()) if per_req_cp_sizes else 1
+
         for idx in range(self.cp_world_size):
             
             if sum(num_scheduled_tokens[idx].values()) == 0 and len(preempted_reqs[idx]) == 0 and len(self.finished_req_ids[idx]) == 0:
@@ -1097,6 +1139,8 @@ class CrossDPScheduler(Scheduler):
                         cp_rank=idx,
                         cp_rank_scheduled_tokens=cp_rank_scheduled_tokens[idx],
                         num_cp_request=sum([1 if cp_size > 1 else 0 for cp_size in  cp_rank_scheduled_tokens[idx].values()]),
+                        actual_cp_size=actual_cp_size,
+                        per_req_cp_sizes=per_req_cp_sizes if self.dycp_enabled else None,
                         none_tokens_in_peer_sched=none_tokens_in_peer_sched
                     )
                 )

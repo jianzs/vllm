@@ -383,3 +383,27 @@ def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
         return FCFSRequestQueue()
     else:
         raise ValueError(f"Unknown scheduling policy: {policy}")
+
+
+def get_cp_size_for_request(
+    num_tokens: int,
+    sorted_thresholds: list[tuple[int, int]],
+) -> int:
+    """Map request token count to cp_size using sorted threshold table.
+
+    Args:
+        num_tokens: Total token count (prompt tokens) of the request.
+        sorted_thresholds: List of (token_threshold, cp_size) sorted ascending
+            by token_threshold.
+
+    Returns:
+        The cp_size for this request. Returns 1 if num_tokens is below
+        all thresholds.
+    """
+    cp_size = 1
+    for threshold, size in sorted_thresholds:
+        if num_tokens >= threshold:
+            cp_size = size
+        else:
+            break
+    return cp_size
