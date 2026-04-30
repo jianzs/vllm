@@ -34,6 +34,10 @@ class PCPManager:
         self.pcp_world_size = pcp_world_size
         self.pcp_rank = pcp_rank
         self.device = device
+        try:
+            self.dycp_rank = get_dycp_group().rank_in_group
+        except AssertionError:
+            self.dycp_rank = 0
 
         # Pre-division buffers may need to be larger than post-division
         # buffers when DyCP schedules multiple CP requests per round.
@@ -92,6 +96,7 @@ class PCPManager:
         arange_np: np.ndarray,
         num_reqs: int,
         reorder_batch_threshold: int | None = None,
+        effective_pcp_world_size: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Update token counts and positions for Prefill Context Parallelism (PCP).
@@ -122,6 +127,8 @@ class PCPManager:
                        efficient batched arange operations.
             num_reqs: Total number of requests in the batch.
             reorder_batch_threshold: Threshold for decode vs prefill requests.
+            effective_pcp_world_size: Override for pcp_world_size (used by DyCP
+                to pass actual_cp_size). When None, uses self.pcp_world_size.
 
         Returns:
             Tuple (pcp_tokens, pcp_positions):
@@ -146,6 +153,18 @@ class PCPManager:
         if num_reqs == 0 or len(num_scheduled_tokens) == 0:
             return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
 
+        # Resolve effective world size and rank for DyCP parameterization.
+        pcp_world_size = (
+            effective_pcp_world_size
+            if effective_pcp_world_size is not None
+            else self.pcp_world_size
+        )
+        pcp_rank = (
+            self.dycp_rank % pcp_world_size
+            if effective_pcp_world_size is not None
+            else self.pcp_rank
+        )
+
         assert reorder_batch_threshold is not None, (
             "PCP depends on reorder batch to split decode and prefill requests."
         )
@@ -155,13 +174,13 @@ class PCPManager:
         # DualChunkSwap requires alignment to a multiple of (2 * pcp_world_size).
         # We first pad each request's token count up to that multiple.
         num_padded_scheduled_tokens = np.ceil(
-            num_scheduled_tokens / (2 * self.pcp_world_size)
-        ).astype(np.int32) * (2 * self.pcp_world_size)
+            num_scheduled_tokens / (2 * pcp_world_size)
+        ).astype(np.int32) * (2 * pcp_world_size)
 
         # PCP does not split decode requests. For decode requests, we instead
         # duplicate the scheduled tokens across the pcp_world_size ranks.
         num_padded_scheduled_tokens[:num_decode_reqs] = (
-            num_scheduled_tokens[:num_decode_reqs] * self.pcp_world_size
+            num_scheduled_tokens[:num_decode_reqs] * pcp_world_size
         )
 
         # Record how many pads were added per request (padded - original).
@@ -181,7 +200,7 @@ class PCPManager:
             < np.repeat(num_scheduled_tokens, num_padded_scheduled_tokens)
         )
 
-        pcp_tokens = num_padded_scheduled_tokens // self.pcp_world_size
+        pcp_tokens = num_padded_scheduled_tokens // pcp_world_size
 
         # Compute per-request "chunk sizes" for the head/tail splitting.
         # For prefill requests, we further split the pcp_tokens into two chunks
@@ -217,7 +236,7 @@ class PCPManager:
             head_start_loc = positions_start_loc + rank * pcp_chunk_sizes
             tail_start_loc = (
                 positions_start_loc
-                + (2 * self.pcp_world_size - rank - 1) * pcp_chunk_sizes
+                + (2 * pcp_world_size - rank - 1) * pcp_chunk_sizes
             )
             # Fill head positions using chunk arange offset by head_start_loc.
             positions[pcp_head_chunk_mask] = pcp_chunk_arange + np.repeat(
@@ -231,7 +250,7 @@ class PCPManager:
             )
             return positions
 
-        positions = get_current_rank_positions(0, self.pcp_rank)
+        positions = get_current_rank_positions(0, pcp_rank)
         # Decode tokens are duplicated only after AG. But their positions are
         # same without prefill context parallel.
         if num_decode_reqs > 0:
@@ -254,7 +273,7 @@ class PCPManager:
                     "num_reqs=%d world=%d",
                     num_clipped,
                     int(num_reqs),
-                    int(self.pcp_world_size),
+                    int(pcp_world_size),
                 )
 
         # Build the restore index used after allgather.
@@ -262,7 +281,7 @@ class PCPManager:
         padded_pos_start_loc[0] = 0
         all_positions_lst = [
             get_current_rank_positions(padded_pos_start_loc, rank_i)
-            for rank_i in range(self.pcp_world_size)
+            for rank_i in range(pcp_world_size)
         ]
         all_positions = np.concatenate(all_positions_lst)
         self.pcp_allgather_restore_idx.np[: all_positions.shape[0]] = (

@@ -1506,6 +1506,7 @@ class GPUModelRunner(
                         self.arange_np,
                         scheduler_output.num_cp_request,
                         self.reorder_batch_threshold,
+                        effective_pcp_world_size=scheduler_output.actual_cp_size,
                     )
                 )
 
@@ -1626,7 +1627,20 @@ class GPUModelRunner(
                 output_idx += num_sched
 
         if self.dycp_world_size > 1:
-            self.input_batch.block_table.compute_domain_slot_mapping(req_indices, positions_np, scheduler_output.num_cp_request)
+            per_req_cp_sizes_np = None
+            if scheduler_output.per_req_cp_sizes is not None:
+                per_req_cp_sizes_np = np.ones(num_reqs, dtype=np.int32)
+                for req_idx in range(num_reqs):
+                    req_id = self.input_batch.req_ids[req_idx]
+                    if req_id in scheduler_output.per_req_cp_sizes:
+                        per_req_cp_sizes_np[req_idx] = (
+                            scheduler_output.per_req_cp_sizes[req_id]
+                        )
+            self.input_batch.block_table.compute_domain_slot_mapping(
+                req_indices, positions_np,
+                scheduler_output.num_cp_request,
+                per_req_cp_sizes_np,
+            )
         else:
             self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
 
