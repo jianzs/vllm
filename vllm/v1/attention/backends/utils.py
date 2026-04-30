@@ -115,6 +115,7 @@ class CommonAttentionMetadata:
 
     num_dycp_reqs: int = 0
     num_dycp_tokens: int = 0
+    actual_cp_size: int = 1
 
     @property
     @deprecated(
@@ -181,6 +182,7 @@ class CommonAttentionMetadata:
             pcp_allgather_restore_idx=self.pcp_allgather_restore_idx,
             num_dycp_reqs=self.num_dycp_reqs,
             num_dycp_tokens=self.num_dycp_tokens,
+            actual_cp_size=self.actual_cp_size,
         )
 
 

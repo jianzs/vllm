@@ -51,6 +51,13 @@ class BatchDescriptor(NamedTuple):
     """
     For cp tokens
     """
+
+    cp_size: int = 1
+    """
+    Actual CP size for this batch. Used as 3rd dimension of CUDA graph key
+    when DyCP is enabled, since different cp_sizes use different NCCL subgroups
+    baked into the graph.
+    """
     
     def relax_for_mixed_batch_cudagraphs(self) -> "BatchDescriptor":
         """

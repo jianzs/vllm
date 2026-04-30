@@ -209,7 +209,7 @@ from vllm.attention.ops.common import cp_lse_ag_out_rs, dycp_lse_out_ar, cp_lse_
 from vllm.attention.ops.merge_attn_states import merge_attn_states
 from vllm.attention.utils.fa_utils import get_flash_attn_version
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed.parallel_state import get_dycp_group, get_dcp_group, get_pcp_group, is_global_first_rank
+from vllm.distributed.parallel_state import get_dycp_group, get_dycp_subgroup, get_dcp_group, get_pcp_group, is_global_first_rank
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
@@ -440,6 +440,7 @@ class MLACommonMetadata(Generic[D]):
     pcp_allgather_restore_idx: torch.Tensor | None = None
     num_dycp_reqs: int = 0
     num_dycp_tokens: int = 0
+    actual_cp_size: int = 1
 
     # Pre-split metadata for mixed DyCP+DP batches.
     # Built once in build(), reused across all layers in forward().
@@ -1678,6 +1679,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             pcp_allgather_restore_idx=pcp_allgather_restore_idx,
             num_dycp_reqs=num_dycp_reqs,
             num_dycp_tokens=num_dycp_tokens,
+            actual_cp_size=common_attn_metadata.actual_cp_size,
         )
 
         # Pre-build split metadata for mixed DyCP+DP batches.
@@ -2828,7 +2830,13 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                     gathered = get_dcp_group().all_gather(gathered, dim=0)
                 gathered = get_pcp_group().all_gather(gathered, dim=0)
             elif self.dycp_world_size > 1 and attn_metadata.num_dycp_reqs > 0:
-                gathered = get_dycp_group().all_gather(local_gathered_kvcache, dim=0)
+                cp_size = attn_metadata.actual_cp_size
+                dycp_group = (
+                    get_dycp_subgroup(cp_size)
+                    if cp_size < self.dycp_world_size
+                    else get_dycp_group()
+                )
+                gathered = dycp_group.all_gather(local_gathered_kvcache, dim=0)
             else:
                 gathered = get_dcp_group().all_gather(local_gathered_kvcache, dim=0)
             cur_allgather_kvcache.copy_(gathered)
@@ -3189,12 +3197,18 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             and full_dycp_prefill
         ):
             assert attn_metadata.pcp_allgather_restore_idx is not None
+            cp_size = attn_metadata.actual_cp_size
+            dycp_group = (
+                get_dycp_subgroup(cp_size)
+                if cp_size < self.dycp_world_size
+                else get_dycp_group()
+            )
             k_c_normed, k_pe = pcp_kv_allgather_and_restore(
                 k_c_normed,
                 k_pe,
                 attn_metadata.num_dycp_tokens,
                 attn_metadata.pcp_allgather_restore_idx,
-                get_dycp_group(),
+                dycp_group,
             )
             dycp_kv_gathered = True
 
@@ -3358,16 +3372,16 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 )
             decode_dycp_reqs = min(attn_metadata.num_dycp_reqs, attn_metadata.num_decodes)
             if decode_dycp_reqs > 0:
-                # attn_out = dycp_lse_out_ar(
-                #     attn_out,
-                #     lse,
-                #     get_dycp_group(),
-                #     num_dycp_reqs=attn_metadata.num_dycp_reqs,
-                # )
+                cp_size = attn_metadata.actual_cp_size
+                dycp_group = (
+                    get_dycp_subgroup(cp_size)
+                    if cp_size < self.dycp_world_size
+                    else get_dycp_group()
+                )
                 attn_out[:decode_dycp_reqs] = cp_lse_ag_out_ar(
                     attn_out[:decode_dycp_reqs],
                     lse[:decode_dycp_reqs],
-                    get_dycp_group(),
+                    dycp_group,
                     is_lse_base_on_e=not getattr(self, "_use_fi_prefill", False),
                 )
 
