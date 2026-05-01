@@ -455,10 +455,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             )
         elif self.dycp_world_size > 1:
             num_dycp_reqs = common_attn_metadata.num_dycp_reqs
+            actual_cp_size = common_attn_metadata.actual_cp_size
             seq_lens[:num_dycp_reqs] = get_cp_local_seq_lens(
                 seq_lens[:num_dycp_reqs],
-                self.dycp_world_size,
-                self.dycp_rank,
+                actual_cp_size,
+                self.dycp_rank % actual_cp_size,
                 self.cp_kv_cache_interleave_size,
             )
             max_seq_len = seq_lens.max().item()
@@ -778,11 +779,11 @@ class FlashAttentionImpl(AttentionImpl):
                         if cp_size < self.dycp_world_size
                         else get_dycp_group()
                     )
-                    output[:attn_metadata.num_dycp_reqs] = cp_lse_ag_out_ar(
-                        output[:attn_metadata.num_dycp_reqs],
-                        temp_lse.transpose(0, 1)[:attn_metadata.num_dycp_reqs],
+                    output = dycp_lse_out_ar(
+                        output,
+                        temp_lse.transpose(0, 1),
                         dycp_group,
-                        return_lse=False,
+                        attn_metadata.num_dycp_reqs,
                     )
                     return output
                 return output

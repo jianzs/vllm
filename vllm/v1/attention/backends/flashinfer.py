@@ -24,7 +24,7 @@ from vllm.attention.backends.abstract import (
     AttentionType,
     MultipleOf,
 )
-from vllm.attention.ops.common import cp_lse_ag_out_rs, cp_lse_ag_out_ar
+from vllm.attention.ops.common import cp_lse_ag_out_rs, cp_lse_ag_out_ar, dycp_lse_out_ar
 from vllm.attention.ops.merge_attn_states import merge_attn_states
 from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
@@ -721,10 +721,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             )
         if self.dycp_world_size > 1:
             num_dycp_reqs = common_attn_metadata.num_dycp_reqs
+            actual_cp_size = common_attn_metadata.actual_cp_size
             seq_lens_cpu[:num_dycp_reqs] = get_cp_local_seq_lens(
                 seq_lens_cpu[:num_dycp_reqs],
-                self.dycp_world_size,
-                self.dycp_rank,
+                actual_cp_size,
+                self.dycp_rank % actual_cp_size,
                 self.cp_kv_cache_interleave_size,
             )
             max_seq_len = seq_lens_cpu.max().item()
@@ -1391,13 +1392,13 @@ class FlashInferImpl(AttentionImpl):
                         lse=lse,
                         return_lse=True,
                     )
-                    output[:attn_metadata.num_dycp_reqs] = cp_lse_ag_out_ar(
-                        output[:attn_metadata.num_dycp_reqs],
-                        lse[:attn_metadata.num_dycp_reqs],
+                    output = dycp_lse_out_ar(
+                        output,
+                        lse,
                         get_dycp_subgroup(attn_metadata.actual_cp_size)
                         if attn_metadata.actual_cp_size < self.dycp_world_size
                         else get_dycp_group(),
-                        return_lse=False,
+                        attn_metadata.num_dycp_reqs,
                     )
                 else:
                     decode_wrapper.run(
