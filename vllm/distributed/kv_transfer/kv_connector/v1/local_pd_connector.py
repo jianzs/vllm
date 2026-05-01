@@ -834,7 +834,11 @@ class LocalPDConnector(KVConnectorBase_V1):
         interleave_size = meta.get("interleave_size", self._interleave_size)
 
         from vllm.distributed.parallel_state import get_dycp_group
-        my_rank = get_dycp_group().rank_in_group
+        my_global_rank = get_dycp_group().rank_in_group
+        # In DyCP, owning_ranks are CP-relative (0..cp_world_size-1).
+        # Map to global ranks for IPC handle lookup and local-rank detection.
+        subgroup_start = (my_global_rank // cp_world_size) * cp_world_size
+        my_cp_rank = my_global_rank % cp_world_size
 
         dst_slot_mapping = req_meta.slot_mapping
         actual_tokens = dst_slot_mapping.shape[0]
@@ -918,11 +922,14 @@ class LocalPDConnector(KVConnectorBase_V1):
             local_base_ptr = kv_cache_layer.data_ptr()
 
             for src_rank, block_pairs in per_rank_copies.items():
-                if src_rank == my_rank:
+                # src_rank is CP-relative (0..cp_world_size-1).
+                # Convert to global rank for IPC handle lookup.
+                src_global_rank = subgroup_start + src_rank
+                if src_global_rank == my_global_rank:
                     # Local rank: copy within same paged buffer
                     src_base_ptr = local_base_ptr
                 else:
-                    ipc_info = self._remote_ipc_info[src_rank][layer_name]
+                    ipc_info = self._remote_ipc_info[src_global_rank][layer_name]
                     remote_ptr = ipc_info[0]
                     src_base_ptr = remote_ptr.value
 
@@ -1102,8 +1109,8 @@ class LocalPDConnector(KVConnectorBase_V1):
 
         # In IPC mode with multi-rank CP, KV is already in paged buffers.
         # No extraction needed — decode reads directly via IPC.
-        cp_size = getattr(attn_metadata, "num_dycp_reqs", 0)
-        if self._ipc_initialized and self._cp_world_size > 1 and cp_size > 0:
+        num_dycp_reqs = getattr(attn_metadata, "num_dycp_reqs", 0)
+        if self._ipc_initialized and self._cp_world_size > 1 and num_dycp_reqs > 0:
             return
 
         is_mla = isinstance(attn_metadata, MLACommonMetadata)
