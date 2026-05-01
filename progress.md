@@ -267,6 +267,31 @@
 - 可能原因：CP=4/8 decode 路径的 NCCL allgather/allreduce 通信开销过大
 - 需要进一步 profiling 确认瓶颈
 
+### Benchmark 结果（2026-05-01，Session 7）
+
+**测试环境**: DeepSeek-V2-Lite, 8×GPU, dp_per_domain=8, FLASHMLA, CrossDPExampleConnector
+
+**DyCP Decode Benchmark（32 prompts, max-concurrency=2, request-rate=2）**:
+| 场景 | Input | Output | CP Size | TTFT P50 | TPOT P50 | ITL P50 | 备注 |
+|------|-------|--------|---------|-----------|-----------|---------|------|
+| Decode | 4K | 1024 | CP=1 | 40.86ms | 7.89ms | 7.86ms | 基线 |
+| Decode | 20K | 1024 | CP=4 | 133.32ms | 81.33ms | 81.05ms | MoE sync 回归 |
+
+**DyCP Streaming 测试（单请求）**:
+| 场景 | Input | Output | CP Size | TTFT | avg ITL | 备注 |
+|------|-------|--------|---------|------|---------|------|
+| Decode | 17K | 50 | CP=4 | 90ms | 9.0ms | 无 prefill 干扰 |
+| Decode | 3K | 50 | CP=1 | ~18ms | ~7ms | 基线 |
+
+**根因分析**：
+- 单请求 CP=4 decode TPOT=9ms，与 CP=1 基线对齐
+- 并发请求 TPOT=81ms 的根因：调度器在同一 step 中将 prefill（KV loading）和 decode 混合调度到不同 DP rank
+  - Ranks [0,1,2,3] 做 decode（1 token, CUDA graph, ~7ms）
+  - Ranks [4,5,6,7] 做 prefill（8 tokens, eager, ~70ms）
+  - MoE all-to-all 强制所有 rank 同步，decode rank 等待 prefill rank
+- 独立 CUDA graph 模式修复正确（decode rank 使用 FULL 模式），但不解决 MoE all-to-all 同步瓶颈
+- 需要修改 CrossDPScheduler 避免在同一 step 中混合 prefill 和 decode 到不同 DP rank
+
 ### Benchmark 结果（2026-05-01，修复后）
 
 **测试环境**: DeepSeek-V2-Lite, 8×GPU, dp_per_domain=8, FLASHMLA
