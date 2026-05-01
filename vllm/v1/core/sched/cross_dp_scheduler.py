@@ -190,9 +190,33 @@ class CrossDPScheduler(Scheduler):
         self.max_cp_tokens = self.vllm_config.scheduler_config.num_cp_seqs
         self.graph_size_for_cp = self.vllm_config.compilation_config.cudagraph_capture_sizes_for_cp
         assert self.max_cp_tokens >= self.graph_size_for_cp, "max_cp_tokens should be greater than or equal to graph_size_for_cp"
-        # Request queue control the token threshold for long requests.
-        _thresh = int(os.environ.get("VLLM_LONG_REQUEST_THRESHOLD",
-                                     128 * 1024))
+
+        # DyCP: threshold-based dynamic CP size
+        self.dycp_enabled = vllm_config.parallel_config.dycp_enabled
+        self.dycp_sorted_thresholds = (
+            vllm_config.parallel_config.dycp_sorted_thresholds
+            if self.dycp_enabled else []
+        )
+
+        # When DyCP is enabled, auto-align long_request_threshold with the
+        # minimum CP>1 threshold so that all CP requests are classified as
+        # "long" and subject to the num_cp_seqs limit. This prevents too many
+        # CP requests from running concurrently and exceeding CUDA graph
+        # capture sizes, which would cause fallback to eager mode.
+        _env_thresh = os.environ.get("VLLM_LONG_REQUEST_THRESHOLD")
+        if _env_thresh is not None:
+            _thresh = int(_env_thresh)
+        elif self.dycp_enabled and self.dycp_sorted_thresholds:
+            _thresh = 128 * 1024  # default fallback
+            for thresh, cp_size in self.dycp_sorted_thresholds:
+                if cp_size > 1:
+                    _thresh = thresh
+                    break
+            logger.info(
+                "CrossDPScheduler: DyCP enabled, auto-setting "
+                "long_request_threshold=%d (min CP>1 threshold)", _thresh)
+        else:
+            _thresh = 128 * 1024
         logger.info("CrossDPScheduler: long_request_threshold=%d", _thresh)
         self.waiting = LongShortRequestQueue(
             long_request_threshold=_thresh,
@@ -201,13 +225,6 @@ class CrossDPScheduler(Scheduler):
         self.request_manager = RequestManager(
             cp_world_size=self.cp_world_size,
             max_num_seqs=self.max_num_running_reqs,
-        )
-
-        # DyCP: threshold-based dynamic CP size
-        self.dycp_enabled = vllm_config.parallel_config.dycp_enabled
-        self.dycp_sorted_thresholds = (
-            vllm_config.parallel_config.dycp_sorted_thresholds
-            if self.dycp_enabled else []
         )
 
     def _update_after_schedule(
@@ -823,9 +840,9 @@ class CrossDPScheduler(Scheduler):
                     break
                 
                 if len(selected_dp) > 1:
-                    logger.info(f"It's a cp req, selected_dp: {selected_dp}, request id: {request.request_id}")
+                    logger.debug("CP req: selected_dp=%s, request_id=%s", selected_dp, request.request_id)
                 else:
-                    logger.info(f"It's a short req, selected_dp: {selected_dp}, request id: {request.request_id}")
+                    logger.debug("Short req: selected_dp=%s, request_id=%s", selected_dp, request.request_id)
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:

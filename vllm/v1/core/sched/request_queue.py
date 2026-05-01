@@ -267,7 +267,6 @@ class LongShortRequestQueue(RequestQueue):
             
             if self.is_long_request(request):
                 # Check if we can schedule more long requests
-                print(f"running_long_count: {self.running_long_count}, max_long_requests: {self.max_long_requests}, has_slot_for_long_request: {self.has_slot_for_long_request}", flush=True)
                 if self.running_long_count >= self.max_long_requests or not self.has_slot_for_long_request:
                     # Skip this long request, continue searching
                     continue
