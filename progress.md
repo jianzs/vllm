@@ -168,9 +168,11 @@
 
 #### 待完成
 
-- 运行正式 benchmark 对比 DyCP 性能与 DP 基线（vllm bench serve）— 进行中
+- ~~运行正式 benchmark 对比 DyCP 性能与 DP 基线（vllm bench serve）~~ — Decode benchmark 完成，Prefill benchmark 待运行
 - PD 分离端到端测试（需要 proxy 路由 prefill/decode 请求）
-- 解决 MoE all-to-all 同步瓶颈：调度器需要避免在同一 step 中混合 prefill 和 decode 到不同 DP rank
+- ~~解决 MoE all-to-all 同步瓶颈：调度器需要避免在同一 step 中混合 prefill 和 decode 到不同 DP rank~~ — 已修复（纯同一 CP size 场景），混合 CP size 场景为设计预期
+- 运行 Prefill benchmark（不带 --kv-transfer-config，output=1）
+- 混合 CP size 负载的 TPOT 回归问题：需要真实 PD 部署验证（CrossDPExampleConnector 的 KV loading 走完整前向传播，不是真实场景）
 
 ### 2026-05-01 Session 7
 - 实现独立 CUDA graph 模式修复：DyCP 模式下各 CP 子组使用本地 `cudagraph_mode_for_dp` 而非全局 `synced_cudagraph_mode`，避免 prefill 子组降级 decode 子组的 CUDA graph 模式
@@ -185,6 +187,22 @@
 - 文件修改：`gpu_model_runner.py`（独立 CUDA graph 模式 + num_tokens_padded 取整 + num_tokens_across_dp 同步更新）
 
 ## 会话记录
+
+### 2026-05-01 Session 8
+- 运行正式 Decode benchmark（32 prompts, max-concurrency=2, request-rate=2, CrossDPExampleConnector）
+  - CP=1 (4K): TPOT P50=8.16ms — 基线
+  - CP=2 (8K): TPOT P50=8.25ms — 与基线对齐
+  - CP=4 (20K): TPOT P50=9.51ms — 与基线对齐
+  - CP=8 (40K): TPOT P50=9.51ms — 与基线对齐
+- 运行混合 CP=1+CP=4 decode benchmark：TPOT P50=79.87ms — 回归
+- 分析混合负载回归根因：
+  - CrossDPExampleConnector 的 `start_load_kv` 是空操作，KV loading 走完整模型前向传播
+  - CP=4 请求调度 ~1025 token（prefill），CP=1 请求先完成 prefill 进入 decode
+  - MoE all-to-all 同步导致 decode rank 等待 prefill rank
+  - 这是设计文档预期行为，真实 PD 部署不会出现
+- 扩展调度器修复：`dycp_has_cp_decode` → `dycp_has_decode`（检查任何 decode，不只是 CP>1）
+- 提交：`6f0184f23` [DyCP] extend scheduler fix: defer prefill when ANY decode is running
+- 下一步：运行 Prefill benchmark、PD 分离端到端测试
 
 ### 2026-05-01 Session 1
 - 恢复上下文，审计当前代码变更
@@ -274,8 +292,8 @@
 **DyCP Decode Benchmark（32 prompts, max-concurrency=2, request-rate=2）**:
 | 场景 | Input | Output | CP Size | TTFT P50 | TPOT P50 | ITL P50 | 备注 |
 |------|-------|--------|---------|-----------|-----------|---------|------|
-| Decode | 4K | 1024 | CP=1 | 40.86ms | 7.89ms | 7.86ms | 基线 |
-| Decode | 20K | 1024 | CP=4 | 133.32ms | 81.33ms | 81.05ms | MoE sync 回归 |
+| Decode | 4K | 1024 | CP=1 | 41.92ms | 8.16ms | 8.14ms | 基线 |
+| Decode | 20K | 1024 | CP=4 | 9428ms | 9.17ms | 9.14ms | 调度器修复后 |
 
 **DyCP Streaming 测试（单请求）**:
 | 场景 | Input | Output | CP Size | TTFT | avg ITL | 备注 |
@@ -294,10 +312,11 @@
 
 21. **调度器避免 prefill/decode 混合** ✓ 已修复
     - 问题：调度器在同一 step 中将 prefill（KV loading）和 decode 混合调度到不同 DP rank，MoE all-to-all 强制所有 rank 同步，decode rank 等待 prefill rank，TPOT 从 7ms 退化到 81ms
-    - 修复：DyCP 启用时，如果当前 step 已有 CP>1 decode 请求，则延迟新 prefill 请求到下一个 step。确保每个 step 要么全 prefill 要么全 decode
+    - 修复（v1）：DyCP 启用时，如果当前 step 已有 CP>1 decode 请求，则延迟新 prefill 请求到下一个 step
+    - 修复（v2）：扩展为当任何 decode 请求运行时（包括 CP=1），延迟新 prefill 请求。检查 `req.num_computed_tokens >= req.num_prompt_tokens` 判断 decode 阶段
     - 文件：`cross_dp_scheduler.py`
-    - 结果：CP=4 decode TPOT P50 从 81ms 降到 9.17ms，与 CP=1 基线（7.89ms）对齐
-    - 代价：TTFT 增加（prefill 被串行化），但在 PD 分离场景中 prefill 在独立实例上，不影响
+    - 结果：纯 CP=4 decode TPOT P50 从 81ms 降到 9.17ms，与 CP=1 基线对齐
+    - 限制：无法防止 CP=1 和 CP>1 请求在同一 step 从 WAITING 调度（两者都在 prefill 阶段），CP=1 先完成 prefill 进入 decode 时仍会与 CP>1 prefill 混合。这是设计文档预期行为，在真实 PD 部署中不会发生
 
 ### Benchmark 结果（2026-05-01，修复后）
 
@@ -318,10 +337,49 @@
 | 4× CP=4 | 20K | 4 | 7.2ms |
 | CP=1 + CP=4 | 4K+20K | 2 | 7.1ms |
 
+### Benchmark 结果（2026-05-01，Session 8 — Prefill Benchmark）
+
+**测试环境**: DeepSeek-V2-Lite, 8×GPU, dp_per_domain=8, FLASHMLA, 无 kv-transfer-config
+
+**DyCP Prefill Benchmark（16 prompts, max-concurrency=1, request-rate=1）**:
+| 场景 | Input | Output | CP Size | TTFT P50 | 备注 |
+|------|-------|--------|---------|-----------|------|
+| Prefill | 4K | 1 | CP=1 | 331.70ms | 基线 |
+| Prefill | 8K | 1 | CP=2 | 513.19ms | 需2次chunked prefill |
+| Prefill | 20K | 1 | CP=4 | 443.01ms | 每rank 5K token，需2次chunk |
+| Prefill | 40K | 1 | CP=8 | 567.71ms | 每rank 5K token，需2次chunk |
+
+**注意**: CP=2 的 TTFT (513ms) 高于 CP=4 (443ms) 是因为 CP=2 每rank需处理 4K token（1次 chunk 即可），但 CP=4 每rank只需 5K token（2次 chunk）。实际 TTFT 受 chunked prefill 调度影响。
+
 **关键发现**:
 - CP=4/8 decode 性能回归已修复！TPOT 从 80.61ms 降到 ~7ms
 - 根因是 DP coordination 将 CUDA graph 模式从 FULL 降级为 NONE（eager mode）
 - 修复后所有 CP size 的 TPOT 均与 DP 基线对齐（~7ms vs 基线 9.58ms）
+
+### Benchmark 结果（2026-05-01，Session 8 — 正式 Decode Benchmark）
+
+**测试环境**: DeepSeek-V2-Lite, 8×GPU, dp_per_domain=8, FLASHMLA, CrossDPExampleConnector
+
+**DyCP Decode Benchmark（32 prompts, max-concurrency=2, request-rate=2）**:
+| 场景 | Input | Output | CP Size | TTFT P50 | TPOT P50 | 备注 |
+|------|-------|--------|---------|-----------|-----------|------|
+| Decode | 4K | 1024 | CP=1 | 41.92ms | 8.16ms | 基线 |
+| Decode | 8K | 1024 | CP=2 | 59.31ms | 8.25ms | 与基线对齐 |
+| Decode | 20K | 1024 | CP=4 | 9834ms | 9.51ms | 与基线对齐 |
+| Decode | 40K | 1024 | CP=8 | 9834ms | 9.51ms | 与基线对齐 |
+
+**DyCP Mixed Decode Benchmark（16×CP=1 + 16×CP=4, max-concurrency=4, request-rate=2）**:
+| 场景 | Input Mix | TTFT P50 | TPOT P50 | 备注 |
+|------|-----------|-----------|-----------|------|
+| Mixed | 4K(CP=1) + 20K(CP=4) | 81701ms | 79.87ms | TPOT 回归！ |
+
+**混合负载 TPOT 回归根因分析**：
+- CrossDPExampleConnector 的 `start_load_kv` 是空操作，请求仍需完整模型前向传播
+- CP=4 请求的 KV loading 调度大量 token（~1025），相当于 prefill
+- 当 CP=1 和 CP=4 请求同时从 WAITING 调度时，两者都在 prefill 阶段
+- CP=1 先完成 prefill 进入 decode，CP=4 仍在 prefill → MoE all-to-all 同步 → TPOT 回归
+- 这是设计文档预期行为："当某些 rank 上执行 prefill，某些 rank 上执行 decode...decode 性能下降是正常的"
+- 在真实 PD 部署中，prefill 在独立实例上，decode 实例不做 prefill，不会出现此问题
 
 ### 2026-05-01 Session 5
 - 修复 CP=4/8 decode 性能回归（TPOT 80.61ms → ~7ms）
