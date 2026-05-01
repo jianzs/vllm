@@ -168,10 +168,10 @@
 
 #### 待完成
 
-- ~~运行正式 benchmark 对比 DyCP 性能与 DP 基线（vllm bench serve）~~ — Decode benchmark 完成，Prefill benchmark 待运行
-- PD 分离端到端测试（需要 proxy 路由 prefill/decode 请求）
-- ~~解决 MoE all-to-all 同步瓶颈：调度器需要避免在同一 step 中混合 prefill 和 decode 到不同 DP rank~~ — 已修复（纯同一 CP size 场景），混合 CP size 场景为设计预期
-- 运行 Prefill benchmark（不带 --kv-transfer-config，output=1）
+- ~~运行正式 benchmark 对比 DyCP 性能与 DP 基线（vllm bench serve）~~ — Decode + Prefill benchmark 均已完成
+- PD 分离端到端测试：prefill 正常，decode KV 加载有 bug（External KV found 但生成内容不正确）— 需进一步调试 `_start_load_kv_ipc`
+- ~~解决 MoE all-to-all 同步瓶颈~~ — 已修复（纯同一 CP size 场景），混合 CP size 场景为设计预期
+- ~~运行 Prefill benchmark（不带 --kv-transfer-config，output=1）~~ — 已完成（Session 9）
 - 混合 CP size 负载的 TPOT 回归问题：需要真实 PD 部署验证（CrossDPExampleConnector 的 KV loading 走完整前向传播，不是真实场景）
 
 ### 2026-05-01 Session 7
@@ -203,6 +203,22 @@
 - 扩展调度器修复：`dycp_has_cp_decode` → `dycp_has_decode`（检查任何 decode，不只是 CP>1）
 - 提交：`6f0184f23` [DyCP] extend scheduler fix: defer prefill when ANY decode is running
 - 下一步：运行 Prefill benchmark、PD 分离端到端测试
+
+#### PD 分离测试（Session 9）
+
+- 创建 `scripts/start_vllm_pd_dycp.sh`：DyCP + LocalPDConnector 启动脚本，包含 `--cp-size-thresholds` 和 proxy/bench/test 子命令
+- 修复 `scripts/sync.sh` 排除 `dycp` 目录的问题，手动同步 `dycp/proxy/` 到远程
+- 服务器启动成功（LocalPDConnector + DyCP，gpu-mem-util=0.7，cudagraph_capture_sizes_for_cp=4）
+- Proxy 启动成功（local_pd_proxy.py on port 9000）
+- 短请求（CP=1，直接转发）通过 proxy 正常工作
+- Prefill 请求（do_remote_decode=True）正确返回 kv_transfer_params：
+  - 包含 pd_request_prefix, cp_world_size, num_prompt_tokens, prompt_token_ids, per_rank_block_ids, interleave_size
+- Decode 请求（do_remote_prefill=True）发现 External KV（14 tokens），但生成内容不正确：
+  - 预期："Paris"（基于 prefill "The capital of France is Paris."）
+  - 实际："Yes, it is."（模型没有正确使用 KV cache）
+- 根因分析：`get_num_new_matched_tokens` 正确返回 ext_tokens=13，scheduler 正确标记 token 为已计算，但 KV 数据可能没有正确注入到 decode 请求的 paged cache
+- 需要进一步调试 `_start_load_kv_ipc` 方法和 block 分配/复制逻辑
+- 之前 DP baseline TTFT 33.70ms 是 CrossDPExampleConnector 测量的（bypass prefill），不是真实 prefill
 
 ### 2026-05-01 Session 1
 - 恢复上下文，审计当前代码变更
@@ -380,6 +396,31 @@
 - CP=1 先完成 prefill 进入 decode，CP=4 仍在 prefill → MoE all-to-all 同步 → TPOT 回归
 - 这是设计文档预期行为："当某些 rank 上执行 prefill，某些 rank 上执行 decode...decode 性能下降是正常的"
 - 在真实 PD 部署中，prefill 在独立实例上，decode 实例不做 prefill，不会出现此问题
+
+### 2026-05-02 Session 9
+- 运行正式 Prefill benchmark（无 kv-transfer-config，output=1）
+- **关键发现**：之前 DP 基线 Prefill TTFT 33.70ms 是 CrossDPExampleConnector 测量的（bypass prefill，只计算 1 个 token），不是真实 prefill
+- 真实 CP=1 prefill TTFT 为 285ms（4K input，DP 模式等效基线）
+- CP=2 prefill 开销 80% 是预期行为：CP prefill 需要对 all-gathered 完整序列计算 `kv_b_proj` 和 attention，计算量随总序列长度增长
+
+**Session 9 Prefill Benchmark（16 prompts, max-concurrency=1, request-rate=1）**:
+| 场景 | Input | Per-rank tokens | CP Size | TTFT P50 | CP 开销 | 备注 |
+|------|-------|-----------------|---------|-----------|---------|------|
+| Prefill | 4K | 4K | CP=1 | 285ms | 基线 | 等效 DP 基线 |
+| Prefill | 8K | 4K | CP=2 | 512ms | +80% | kv_b_proj+attention 2x |
+| Prefill | 20K | 5K | CP=4 | 440ms | +54% | 2 chunked steps |
+| Prefill | 40K | 5K | CP=8 | 583ms | +105% | 2 chunked steps |
+
+**CP 开销分析**：
+- CP=2 (8K): 每个rank处理 4K tokens，但需对完整 8K 序列计算 `kv_b_proj`（2x）和 attention（4K×8K vs 4K×4K = 2x），加上 NCCL all-gather 通信
+- CP=4 (20K): 每个rank处理 5K tokens（2 chunked steps），对完整 20K 序列计算 `kv_b_proj` 和 attention
+- CP=8 (40K): 同 CP=4，但 all-gather 涉及 8 个 rank，通信开销更大
+- 这是上下文并行的固有代价，不是 bug。DyCP 的核心价值是支持长上下文和动态调整 CP size
+
+**待完成**：
+- ~~运行 Prefill benchmark（不带 --kv-transfer-config，output=1）~~ — 已完成
+- PD 分离端到端测试（需要 proxy 路由 prefill/decode 请求）
+- 混合 CP size 负载的 TPOT 回归问题：需要真实 PD 部署验证
 
 ### 2026-05-01 Session 5
 - 修复 CP=4/8 decode 性能回归（TPOT 80.61ms → ~7ms）
