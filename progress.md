@@ -454,8 +454,38 @@
     - 修复：改回 `delay_free = actual_cp_count > 1`，CP=1 通过 legacy path 解决 blocks 释放问题
 
 - 远程测试发现新问题：PD 分离请求的 `cp_world_size` 不正确（2016 token 请求使用 CP=8 而非 CP=1），导致 IPC load 的 interleave mapping 错误
-  - 需要进一步调查调度器如何为 PD 分离请求分配 CP size
-  - 文件修改：`local_pd_connector.py`, `cp_utils.py`, `flashinfer.py`, `flash_attn.py`, `mla/common.py`
+  - 根因分析见 Session 11
+
+### 2026-05-02 Session 11
+- **根因分析**：PD prefill 请求 `cp_world_size=8` 问题
+  - 测试脚本 `start_vllm_pd_lowthresh.sh` 设置 `VLLM_LONG_REQUEST_THRESHOLD=100`
+  - 调度器读取同一环境变量，将 `long_request_threshold` 也设为 100
+  - 2016 token 请求被分类为 "long"（2016 >= 100），`select_dp` 返回所有 8 个 DP rank
+  - 这导致 prefill 请求使用 CP=8（全 rank），但 decode 请求使用 CP=1
+  - IPC load 使用 `cp_world_size=8` 的 interleave mapping，但实际 KV 只在一个 rank 上
+
+  更深层的问题：即使不设 `VLLM_LONG_REQUEST_THRESHOLD`，当 DyCP 启用时也存在类似 bug：
+  - DyCP 阈值 `[(4096, 1), (16384, 4), (32768, 8)]`，`long_request_threshold=16384`
+  - 8K token 请求：`cp_size=1`（< 16384），但 `is_long=True`（>= 100 如果设了环境变量）
+  - `select_dp` 中 `cp_size=1` 但 `is_long=True`，走入 `elif is_long` 分支，返回所有 8 rank
+  - DyCP 的阈值逻辑被 `is_long` 分类覆盖
+
+28. **`select_dp` 中 DyCP `cp_size=1` 被 `is_long` 覆盖** ✓ 已修复
+    - 问题：当 DyCP 启用且 `cp_size=1` 时，`is_long=True` 仍使 `select_dp` 返回所有 rank
+    - 修复：将 `elif is_long` 改为 `elif is_long and cp_size < 1`，确保 DyCP 阈值逻辑优先
+    - 当 `cp_size >= 1`（DyCP 启用），阈值逻辑是权威的：`cp_size=1` 表示单 rank
+    - 当 `cp_size == 0`（DyCP 未启用），`is_long` 分类决定 rank 数量
+    - 文件：`cross_dp_scheduler.py`
+
+29. **PD prefill 请求无 DyCP 时被错误分类为 long** ✓ 已修复
+    - 问题：PD prefill 请求（`do_remote_decode=True`）在无 DyCP 时被 `is_long` 分类分配所有 rank
+    - 但 decode 请求（`do_remote_prefill=True`）始终使用 CP=1
+    - 导致 `cp_world_size` 不匹配，IPC load 的 interleave mapping 错误
+    - 修复：对 PD prefill 请求，当 DyCP 未启用时也强制 `is_long=False`
+    - 同时修复 `_free_request` 和 preemption 路径中的 `is_long` 计算保持一致
+    - 文件：`cross_dp_scheduler.py`
+
+- 下一步：同步到远程机器，运行 PD 分离端到端测试
 
 ### 2026-05-01 Session 5
 - 修复 CP=4/8 decode 性能回归（TPOT 80.61ms → ~7ms）
