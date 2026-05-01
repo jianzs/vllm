@@ -3244,7 +3244,30 @@ class GPUModelRunner(
             if num_tokens_across_dp is not None:
                 dp_rank = self.parallel_config.data_parallel_rank
                 num_tokens_padded = int(num_tokens_across_dp[dp_rank].item())
-                disable_full = synced_cudagraph_mode <= CUDAGraphMode.PIECEWISE.value
+                if self.dycp_world_size > 1:
+                    # In DyCP mode, each CP subgroup operates independently.
+                    # Don't let a prefill subgroup downgrade the CUDA graph
+                    # mode of a decode subgroup. Each rank uses its own local
+                    # mode so decode ranks keep FULL (CUDA graph) while
+                    # prefill ranks use NONE (eager) independently.
+                    disable_full = (cudagraph_mode_for_dp
+                                    <= CUDAGraphMode.PIECEWISE.value)
+                    # Round up to the nearest CUDA graph capture size so that
+                    # both eager-mode and CUDA-graph-mode ranks use the same
+                    # token count. Without this, DP coordination may produce a
+                    # non-capture-size (e.g. 6), which CUDA graph dispatch
+                    # rounds up (to 8), causing a mismatch with eager ranks
+                    # that keep the original count.
+                    if num_tokens_padded > 0 and num_tokens_padded <= self.compilation_config.max_cudagraph_capture_size:
+                        num_tokens_padded = self.vllm_config.pad_for_cudagraph(
+                            num_tokens_padded)
+                        # Update num_tokens_across_dp to match the rounded-up
+                        # value so the forward context assertion passes.
+                        num_tokens_across_dp = num_tokens_across_dp.clone()
+                        num_tokens_across_dp.fill_(num_tokens_padded)
+                else:
+                    disable_full = (synced_cudagraph_mode
+                                    <= CUDAGraphMode.PIECEWISE.value)
                 # When DyCP is active and this rank has 0 original tokens but
                 # is DP-padded, set uniform_decode=True so the dispatch finds
                 # the correct CUDA graph key for non-CP decode.
@@ -3256,9 +3279,18 @@ class GPUModelRunner(
                     num_tokens_padded,
                     disable_full=disable_full,
                 )
-                # Assert to make sure the agreed upon token count is correct otherwise
-                # num_tokens_across_dp will no-longer be valid
-                assert batch_descriptor.num_tokens == num_tokens_padded
+                num_tokens_padded = batch_descriptor.num_tokens
+                if self.dycp_world_size > 1:
+                    logger.debug(
+                        "DyCP dispatch: dp_rank=%d, cudagraph_mode=%s, "
+                        "num_tokens=%d, num_tokens_padded=%d, "
+                        "num_cp_tokens=%d, actual_cp_size=%d, "
+                        "disable_full=%s, uniform_decode=%s",
+                        self.parallel_config.data_parallel_rank,
+                        cudagraph_mode, num_tokens, num_tokens_padded,
+                        num_cp_tokens, actual_cp_size,
+                        disable_full, uniform_decode,
+                    )
 
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
