@@ -1396,7 +1396,8 @@ class FlashInferImpl(AttentionImpl):
                         output,
                         lse,
                         get_dycp_subgroup(attn_metadata.actual_cp_size)
-                        if attn_metadata.actual_cp_size < self.dycp_world_size
+                        if attn_metadata.actual_cp_size > 1
+                        and attn_metadata.actual_cp_size < self.dycp_world_size
                         else get_dycp_group(),
                         attn_metadata.num_dycp_reqs,
                     )

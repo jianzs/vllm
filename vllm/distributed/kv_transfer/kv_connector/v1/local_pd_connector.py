@@ -6,17 +6,21 @@ In local PD separation mode:
 - Decode phase: the single decode rank loads KV and injects into paged cache
 
 Two KV transfer modes:
-1. CUDA IPC (default for multi-CP): direct GPU-to-GPU memcpy via IPC handles
-2. GPU buffer (fallback for single-CP): all-gather + in-memory buffer
+1. CUDA IPC (default): direct GPU-to-GPU memcpy via IPC handles
+2. GPU buffer (fallback when IPC not initialized): in-memory buffer
+
+IPC mode uses block-level copies from prefill ranks' paged buffers to
+the decode rank's paged buffer, respecting the interleave layout. The
+prefill_cp_ranks metadata ensures correct source rank mapping regardless
+of which DP rank the decode request is scheduled on.
 
 KNOWN LIMITATION (v1):
-  KV reconstruction uses simple concatenation (torch.cat) which assumes
-  ranks hold contiguous token ranges. With DualChunkSwap, tokens are
-  interleaved across ranks in a head/tail pattern, so concatenation may
-  produce incorrectly ordered KV. This needs to be addressed by saving
-  the PCPManager's restore index (pcp_allgather_restore_idx) and applying
-  it during load. For initial testing, validate KV correctness by comparing
-  outputs with and without PD separation.
+  The legacy GPU buffer path (_start_load_kv_legacy) uses simple
+  concatenation (torch.cat) which assumes ranks hold contiguous token
+  ranges. With DualChunkSwap, tokens are interleaved across ranks in a
+  head/tail pattern, so concatenation may produce incorrectly ordered KV.
+  The IPC path is not affected because it uses block-level copies that
+  respect the interleave layout.
 """
 
 import ctypes
@@ -415,6 +419,7 @@ class LocalPDConnector(KVConnectorBase_V1):
                         "interleave_size": kv_params.get("interleave_size", self._interleave_size),
                         "block_size": self._block_size,
                         "pd_request_prefix": prefix,
+                        "prefill_cp_ranks": kv_params.get("prefill_cp_ranks"),
                     }
                     self._completed_prefills[prefix] = meta
                     logger.info(
@@ -727,6 +732,8 @@ class LocalPDConnector(KVConnectorBase_V1):
                 "per_rank_block_ids": per_rank_block_ids,
                 "interleave_size": self._interleave_size,
                 "prefill_req_id": request.request_id,
+                "prefill_cp_ranks": list(request.cp_ranks)
+                if request.cp_ranks else None,
             }
 
             # Store in memory (no file I/O)
@@ -753,10 +760,19 @@ class LocalPDConnector(KVConnectorBase_V1):
                 "prompt_token_ids": list(request.prompt_token_ids),
                 "per_rank_block_ids": per_rank_block_ids,
                 "interleave_size": self._interleave_size,
+                "prefill_cp_ranks": list(request.cp_ranks)
+                if request.cp_ranks else None,
             }
             # IPC mode: delay freeing prefill blocks until decode reads them.
             # The worker's get_finished() returns finished_sending
             # after start_load_kv completes IPC copy.
+            # For multi-CP requests (actual_cp_count > 1), the IPC copy
+            # reads from multiple ranks' paged buffers, so blocks must
+            # not be freed until the copy completes.
+            # For single-CP requests (actual_cp_count == 1), the KV data
+            # is extracted to _gpu_kv_buffer by save_kv_layer during the
+            # prefill step, so blocks can be freed immediately — the
+            # worker-side start_load_kv uses the legacy path for CP=1.
             delay_free = actual_cp_count > 1
             if delay_free:
                 self._ipc_delayed_prefill_ids[prefix] = request.request_id
@@ -794,7 +810,21 @@ class LocalPDConnector(KVConnectorBase_V1):
 
             prefix = req_meta.pd_request_prefix
 
-            if self._ipc_initialized:
+            # Determine CP size for this request from IPC metadata.
+            # For CP=1 requests, use the legacy path (_gpu_kv_buffer)
+            # because the scheduler may have already freed the prefill
+            # blocks (delay_free=False for CP=1). The legacy path reads
+            # from the GPU buffer which was populated by save_kv_layer
+            # during the prefill step.
+            # For CP>1 requests, use the IPC path which reads directly
+            # from the prefill ranks' paged buffers (blocks are kept
+            # alive via delay_free=True).
+            cp_world_size = 1
+            ipc_meta = metadata.ipc_prefill_metas.get(prefix)
+            if ipc_meta:
+                cp_world_size = ipc_meta.get("cp_world_size", 1)
+
+            if self._ipc_initialized and cp_world_size > 1:
                 self._start_load_kv_ipc(
                     req_meta, forward_context, prefix
                 )
@@ -835,10 +865,28 @@ class LocalPDConnector(KVConnectorBase_V1):
 
         from vllm.distributed.parallel_state import get_dycp_group
         my_global_rank = get_dycp_group().rank_in_group
-        # In DyCP, owning_ranks are CP-relative (0..cp_world_size-1).
-        # Map to global ranks for IPC handle lookup and local-rank detection.
-        subgroup_start = (my_global_rank // cp_world_size) * cp_world_size
-        my_cp_rank = my_global_rank % cp_world_size
+
+        # Use the actual prefill CP ranks from metadata to determine
+        # the source subgroup. This is critical because the decode rank
+        # may not be in the same CP subgroup as the prefill ranks.
+        prefill_cp_ranks = meta.get("prefill_cp_ranks")
+        if prefill_cp_ranks and len(prefill_cp_ranks) == cp_world_size:
+            # Use actual prefill ranks: per_rank_block_ids[i] corresponds
+            # to prefill_cp_ranks[i]
+            prefill_rank_map = prefill_cp_ranks
+        else:
+            # Fallback: assume decode rank is in the same subgroup
+            # (may be incorrect if prefill and decode are on different subgroups)
+            logger.warning(
+                "IPC KV load: prefill_cp_ranks missing or mismatched "
+                "(got %s, cp_world_size=%d), falling back to subgroup "
+                "inference from decode rank %d",
+                prefill_cp_ranks, cp_world_size, my_global_rank,
+            )
+            subgroup_start = (my_global_rank // cp_world_size) * cp_world_size
+            prefill_rank_map = [
+                subgroup_start + i for i in range(cp_world_size)
+            ]
 
         dst_slot_mapping = req_meta.slot_mapping
         actual_tokens = dst_slot_mapping.shape[0]
@@ -923,8 +971,8 @@ class LocalPDConnector(KVConnectorBase_V1):
 
             for src_rank, block_pairs in per_rank_copies.items():
                 # src_rank is CP-relative (0..cp_world_size-1).
-                # Convert to global rank for IPC handle lookup.
-                src_global_rank = subgroup_start + src_rank
+                # Map to global rank using prefill_cp_ranks.
+                src_global_rank = prefill_rank_map[src_rank]
                 if src_global_rank == my_global_rank:
                     # Local rank: copy within same paged buffer
                     src_base_ptr = local_base_ptr
@@ -1006,9 +1054,11 @@ class LocalPDConnector(KVConnectorBase_V1):
         elapsed = (_time.monotonic() - t0) * 1000
         logger.info(
             "IPC KV async launched for prefix=%s: %d layers, %d tokens "
-            "from %d ranks in %.1fms (decode=%s, prefill=%s)",
+            "from %d ranks (prefill_ranks=%s, decode_rank=%d) in %.1fms "
+            "(decode=%s, prefill=%s)",
             prefix, layers_injected, actual_tokens,
-            cp_world_size, elapsed, decode_req_id, prefill_req_id,
+            cp_world_size, prefill_rank_map, my_global_rank, elapsed,
+            decode_req_id, prefill_req_id,
         )
 
     def _start_load_kv_legacy(

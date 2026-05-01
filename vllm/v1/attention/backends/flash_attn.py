@@ -776,7 +776,7 @@ class FlashAttentionImpl(AttentionImpl):
                     cp_size = attn_metadata.actual_cp_size
                     dycp_group = (
                         get_dycp_subgroup(cp_size)
-                        if cp_size < self.dycp_world_size
+                        if cp_size > 1 and cp_size < self.dycp_world_size
                         else get_dycp_group()
                     )
                     output = dycp_lse_out_ar(

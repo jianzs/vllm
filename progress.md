@@ -169,7 +169,7 @@
 #### 待完成
 
 - ~~运行正式 benchmark 对比 DyCP 性能与 DP 基线（vllm bench serve）~~ — Decode + Prefill benchmark 均已完成
-- PD 分离端到端测试：prefill 正常，decode KV 加载有 bug（External KV found 但生成内容不正确）— 需进一步调试 `_start_load_kv_ipc`
+- PD 分离端到端测试：修复了 3 个 KV loading bug（见 Session 10），需在远程机器上验证
 - ~~解决 MoE all-to-all 同步瓶颈~~ — 已修复（纯同一 CP size 场景），混合 CP size 场景为设计预期
 - ~~运行 Prefill benchmark（不带 --kv-transfer-config，output=1）~~ — 已完成（Session 9）
 - 混合 CP size 负载的 TPOT 回归问题：需要真实 PD 部署验证（CrossDPExampleConnector 的 KV loading 走完整前向传播，不是真实场景）
@@ -419,8 +419,43 @@
 
 **待完成**：
 - ~~运行 Prefill benchmark（不带 --kv-transfer-config，output=1）~~ — 已完成
-- PD 分离端到端测试（需要 proxy 路由 prefill/decode 请求）
+- PD 分离端到端测试：修复了 3 个 KV loading bug，需远程验证
 - 混合 CP size 负载的 TPOT 回归问题：需要真实 PD 部署验证
+
+### 2026-05-02 Session 10
+- 深入分析 PD 分离端到端测试中 decode 生成内容不正确的根因
+- 发现并修复 6 个 bug：
+
+22. **`delay_free` 逻辑错误：CP=1 时 prefill blocks 被提前释放** ✓ 已修复
+    - 问题：`request_finished` 中 `delay_free = actual_cp_count > 1`，CP=1 时 blocks 立即释放，但 KV 数据可能还未被 decode 读取
+    - 修复：保持 `delay_free = actual_cp_count > 1`（CP>1 延迟释放），CP=1 改用 legacy path（从 `_gpu_kv_buffer` 读取，不依赖 paged buffer blocks）
+    - 影响：CP=1 的 PD 分离请求之前无法正确加载 KV
+
+23. **`subgroup_start` 计算假设 decode rank 与 prefill 在同一子组** ✓ 已修复
+    - 问题：`_start_load_kv_ipc` 中 `subgroup_start = (my_global_rank // cp_world_size) * cp_world_size` 假设 decode rank 在 prefill 的 CP 子组内，但 decode 请求可能被调度到不同 DP rank
+    - 修复：在 `request_finished` 的 metadata 和 `return_params` 中添加 `prefill_cp_ranks`，IPC load 使用 `prefill_rank_map[src_rank]` 替代 `subgroup_start + src_rank`
+    - 影响：CP>1 的 PD 分离请求，如果 decode 被调度到非 prefill 子组的 rank，IPC copy 会从错误 rank 读取数据
+
+24. **`get_num_new_matched_tokens` 重建 metadata 缺少 `prefill_cp_ranks`** ✓ 已修复
+    - 问题：proxy 转发 decode 请求时，重建 metadata 缺少 `prefill_cp_ranks` 字段
+    - 修复：在重建逻辑中添加 `prefill_cp_ranks: kv_params.get("prefill_cp_ranks")`
+
+25. **CP=1 时 `start_load_kv` 使用 IPC path 但 blocks 已释放** ✓ 已修复
+    - 问题：CP=1 的 prefill blocks 不延迟释放（delay_free=False），但 `start_load_kv` 仍使用 IPC path 读取 paged buffer，读到已释放的 blocks
+    - 修复：在 `start_load_kv` 中检查请求的 `cp_world_size`，CP=1 使用 legacy path（从 `_gpu_kv_buffer` 读取），CP>1 使用 IPC path
+
+26. **`get_dycp_subgroup(1)` 崩溃：CP=1 没有对应的 NCCL 子组** ✓ 已修复
+    - 问题：DyCP 代码中多处 `get_dycp_subgroup(actual_cp_size)` 在 `actual_cp_size=1` 时调用，但 CP=1 不创建 NCCL 子组
+    - 修复：将条件从 `actual_cp_size > 0 and actual_cp_size < dycp_world_size` 改为 `actual_cp_size > 1 and actual_cp_size < dycp_world_size`
+    - 文件：`cp_utils.py`, `flashinfer.py`, `flash_attn.py`, `mla/common.py`
+
+27. **`request_finished` 中 `delay_free` 引用 scheduler 端不存在的 `_ipc_initialized`** ✓ 已修复
+    - 问题：`delay_free = self._ipc_initialized` 在 scheduler 端报 `AttributeError`，因为 `_ipc_initialized` 只在 worker 端设置
+    - 修复：改回 `delay_free = actual_cp_count > 1`，CP=1 通过 legacy path 解决 blocks 释放问题
+
+- 远程测试发现新问题：PD 分离请求的 `cp_world_size` 不正确（2016 token 请求使用 CP=8 而非 CP=1），导致 IPC load 的 interleave mapping 错误
+  - 需要进一步调查调度器如何为 PD 分离请求分配 CP size
+  - 文件修改：`local_pd_connector.py`, `cp_utils.py`, `flashinfer.py`, `flash_attn.py`, `mla/common.py`
 
 ### 2026-05-01 Session 5
 - 修复 CP=4/8 decode 性能回归（TPOT 80.61ms → ~7ms）

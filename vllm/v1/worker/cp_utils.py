@@ -405,7 +405,7 @@ class PCPManager:
             return slot_mapping[:0]
         dycp_group = (
             get_dycp_subgroup(actual_cp_size)
-            if actual_cp_size > 0
+            if actual_cp_size > 1
             and actual_cp_size < self.dycp_world_size
             else get_dycp_group()
         )
@@ -452,7 +452,7 @@ class PCPManager:
             return hidden_states[:0]
         dycp_group = (
             get_dycp_subgroup(actual_cp_size)
-            if actual_cp_size > 0
+            if actual_cp_size > 1
             and actual_cp_size < self.dycp_world_size
             else get_dycp_group()
         )
