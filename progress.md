@@ -292,6 +292,13 @@
 - 独立 CUDA graph 模式修复正确（decode rank 使用 FULL 模式），但不解决 MoE all-to-all 同步瓶颈
 - 需要修改 CrossDPScheduler 避免在同一 step 中混合 prefill 和 decode 到不同 DP rank
 
+21. **调度器避免 prefill/decode 混合** ✓ 已修复
+    - 问题：调度器在同一 step 中将 prefill（KV loading）和 decode 混合调度到不同 DP rank，MoE all-to-all 强制所有 rank 同步，decode rank 等待 prefill rank，TPOT 从 7ms 退化到 81ms
+    - 修复：DyCP 启用时，如果当前 step 已有 CP>1 decode 请求，则延迟新 prefill 请求到下一个 step。确保每个 step 要么全 prefill 要么全 decode
+    - 文件：`cross_dp_scheduler.py`
+    - 结果：CP=4 decode TPOT P50 从 81ms 降到 9.17ms，与 CP=1 基线（7.89ms）对齐
+    - 代价：TTFT 增加（prefill 被串行化），但在 PD 分离场景中 prefill 在独立实例上，不影响
+
 ### Benchmark 结果（2026-05-01，修复后）
 
 **测试环境**: DeepSeek-V2-Lite, 8×GPU, dp_per_domain=8, FLASHMLA
