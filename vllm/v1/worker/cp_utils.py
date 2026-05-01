@@ -6,7 +6,11 @@ import torch
 import numpy as np
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.distributed.parallel_state import get_pcp_group, get_dycp_group
+from vllm.distributed.parallel_state import (
+    get_pcp_group,
+    get_dycp_group,
+    get_dycp_subgroup,
+)
 from vllm.logger import logger
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -36,8 +40,10 @@ class PCPManager:
         self.device = device
         try:
             self.dycp_rank = get_dycp_group().rank_in_group
+            self.dycp_world_size = get_dycp_group().world_size
         except AssertionError:
             self.dycp_rank = 0
+            self.dycp_world_size = 1
 
         # Pre-division buffers may need to be larger than post-division
         # buffers when DyCP schedules multiple CP requests per round.
@@ -389,10 +395,17 @@ class PCPManager:
         self,
         slot_mapping: torch.Tensor,
         num_tokens_unpadded: int,
+        actual_cp_size: int = 0,
     ) -> torch.Tensor:
         if num_tokens_unpadded == 0:
             return slot_mapping[:0]
-        slot_mapping = get_dycp_group().all_gather(
+        dycp_group = (
+            get_dycp_subgroup(actual_cp_size)
+            if actual_cp_size > 0
+            and actual_cp_size < self.dycp_world_size
+            else get_dycp_group()
+        )
+        slot_mapping = dycp_group.all_gather(
             slot_mapping[:num_tokens_unpadded],
             0,
         )
@@ -426,13 +439,20 @@ class PCPManager:
         )
 
     def get_dycp_restore_hidden_states(
-        self, hidden_states: torch.Tensor, num_tokens_unpadded: int
+        self, hidden_states: torch.Tensor, num_tokens_unpadded: int,
+        actual_cp_size: int = 0,
     ):
         # NOTE we must `slice` hidden_states because pcp_allgather_restore_idx
         # ignores the padding from CUDA Graph.
         if num_tokens_unpadded == 0:
             return hidden_states[:0]
-        hidden_states = get_dycp_group().all_gather(
+        dycp_group = (
+            get_dycp_subgroup(actual_cp_size)
+            if actual_cp_size > 0
+            and actual_cp_size < self.dycp_world_size
+            else get_dycp_group()
+        )
+        hidden_states = dycp_group.all_gather(
             hidden_states[:num_tokens_unpadded],
             0,
         )

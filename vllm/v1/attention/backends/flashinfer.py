@@ -28,7 +28,11 @@ from vllm.attention.ops.common import cp_lse_ag_out_rs, cp_lse_ag_out_ar
 from vllm.attention.ops.merge_attn_states import merge_attn_states
 from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
-from vllm.distributed.parallel_state import get_dcp_group, get_dycp_group
+from vllm.distributed.parallel_state import (
+    get_dcp_group,
+    get_dycp_group,
+    get_dycp_subgroup,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
@@ -1390,7 +1394,9 @@ class FlashInferImpl(AttentionImpl):
                     output[:attn_metadata.num_dycp_reqs] = cp_lse_ag_out_ar(
                         output[:attn_metadata.num_dycp_reqs],
                         lse[:attn_metadata.num_dycp_reqs],
-                        get_dycp_group(),
+                        get_dycp_subgroup(attn_metadata.actual_cp_size)
+                        if attn_metadata.actual_cp_size < self.dycp_world_size
+                        else get_dycp_group(),
                         return_lse=False,
                     )
                 else:

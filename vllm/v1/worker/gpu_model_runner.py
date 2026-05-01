@@ -1810,6 +1810,7 @@ class GPUModelRunner(
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         num_dycp_reqs: int = 0,
         num_dycp_tokens: int = 0,
+        actual_cp_size: int = 1,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -1927,7 +1928,7 @@ class GPUModelRunner(
             causal=True,
             num_dycp_reqs=num_dycp_reqs,
             num_dycp_tokens=num_dycp_tokens,
-            actual_cp_size=scheduler_output.actual_cp_size,
+            actual_cp_size=actual_cp_size,
         )
         if self.dycp_world_size > 1 and num_dycp_reqs > 0:
             per_req_cp_sizes_np = self._per_req_cp_sizes_np
@@ -3470,6 +3471,7 @@ class GPUModelRunner(
                         cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                         num_dycp_reqs=scheduler_output.num_cp_request,
                         num_dycp_tokens=num_dycp_tokens,
+                        actual_cp_size=scheduler_output.actual_cp_size,
                     )
                 )
 
@@ -3550,6 +3552,7 @@ class GPUModelRunner(
 
                     dycp_hidden_states = self.pcp_manager.get_dycp_restore_hidden_states(
                         dycp_hidden_states, num_dycp_tokens_unpadded,
+                        actual_cp_size=scheduler_output.actual_cp_size,
                     )
 
                     hidden_states = torch.cat([dycp_hidden_states, non_dycp_hidden_states], dim=0)
@@ -4585,6 +4588,7 @@ class GPUModelRunner(
                 for_cudagraph_capture=is_graph_capturing,
                 num_dycp_reqs=num_cp_tokens,
                 num_dycp_tokens=0,  # CUDA graph capture uses dummy values
+                actual_cp_size=actual_cp_size,
             )
 
         with self.maybe_dummy_run_with_lora(

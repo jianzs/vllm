@@ -33,7 +33,11 @@ if is_flash_attn_varlen_func_available():
     )
 from vllm.config import VllmConfig, get_current_vllm_config, get_layers_from_vllm_config
 from vllm.config.cache import CacheDType
-from vllm.distributed.parallel_state import get_dcp_group, get_dycp_group
+from vllm.distributed.parallel_state import (
+    get_dcp_group,
+    get_dycp_group,
+    get_dycp_subgroup,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
@@ -768,10 +772,16 @@ class FlashAttentionImpl(AttentionImpl):
                 )
 
                 if self.dycp_world_size > 1:
+                    cp_size = attn_metadata.actual_cp_size
+                    dycp_group = (
+                        get_dycp_subgroup(cp_size)
+                        if cp_size < self.dycp_world_size
+                        else get_dycp_group()
+                    )
                     output[:attn_metadata.num_dycp_reqs] = cp_lse_ag_out_ar(
                         output[:attn_metadata.num_dycp_reqs],
                         temp_lse.transpose(0, 1)[:attn_metadata.num_dycp_reqs],
-                        get_dycp_group(),
+                        dycp_group,
                         return_lse=False,
                     )
                     return output
