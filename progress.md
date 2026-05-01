@@ -157,9 +157,19 @@
     - 同时修正 `save_kv_layer` 中 `cp_size` → `num_dycp_reqs` 变量名
     - 文件：`local_pd_connector.py`
 
+20. **CP=4/8 decode 性能回归根因：DP coordination 降级 CUDA graph 模式** ✓ 已修复
+    - 问题：`coordinate_batch_across_dp` 对所有 DP rank 取 cudagraph_mode 最小值。当 CP=4 请求在 ranks [0,1,2,3] 时，ranks [4,5,6,7] 有 0 tokens 并 dispatch 为 NONE，导致所有 rank 降级为 eager 模式（50ms+/step vs CUDA graph 2ms/step）
+    - 修复（3 处改动）：
+      1. `dp_utils.py`：`_post_process_cudagraph_mode` 忽略 0 tokens 的 rank（它们没有实际工作，不应影响有 tokens 的 rank 的 CUDA graph 决策）
+      2. `gpu_model_runner.py`：当 DyCP 活跃且本 rank 有 0 tokens 时，向 DP coordination 报告 FULL 模式（而非 NONE），防止降级其他 rank；DP padding 后设 `uniform_decode=True` 以匹配正确的 graph key
+      3. `gpu_model_runner.py`：dispatch lambda 中 `cp_size=actual_cp_size if num_cp_tokens > 0 else 1`（非 CP rank 应使用 cp_size=1 匹配已捕获的 graph key）
+    - 文件：`dp_utils.py`, `gpu_model_runner.py`
+    - 结果：CP=4 decode TPOT 从 80.61ms 降到 ~7ms，与 CP=1 对齐
+
 #### 待完成
 
-- 运行 benchmark 对比 DyCP 性能与 DP 基线
+- 运行正式 benchmark 对比 DyCP 性能与 DP 基线（vllm bench serve）
+- 清理 debug timing 代码
 - PD 分离端到端测试（需要 proxy 路由 prefill/decode 请求）
 
 ## 会话记录
@@ -244,3 +254,34 @@
 - CP=4 decode 性能严重回归（TPOT P50 80.61ms vs 基线 9.58ms，~8.4x 慢）
 - 可能原因：CP=4/8 decode 路径的 NCCL allgather/allreduce 通信开销过大
 - 需要进一步 profiling 确认瓶颈
+
+### Benchmark 结果（2026-05-01，修复后）
+
+**测试环境**: DeepSeek-V2-Lite, 8×GPU, dp_per_domain=8, FLASHMLA
+
+**DyCP 修复后结果（快速测试，streaming TPOT）**:
+| 场景 | Input | CP Size | TTFT | TPOT |
+|------|-------|---------|------|------|
+| Decode | 4K | CP=1 | 18.4ms | 6.8ms |
+| Decode | 8K | CP=2 | 18.7ms | 6.8ms |
+| Decode | 20K | CP=4 | 26.3ms | 6.9ms |
+| Decode | 40K | CP=8 | 38.5ms | 7.0ms |
+
+**并发测试**:
+| 场景 | Input | 并发数 | est TPOT |
+|------|-------|--------|----------|
+| 2× CP=4 | 20K | 2 | 7.7ms |
+| 4× CP=4 | 20K | 4 | 7.2ms |
+| CP=1 + CP=4 | 4K+20K | 2 | 7.1ms |
+
+**关键发现**:
+- CP=4/8 decode 性能回归已修复！TPOT 从 80.61ms 降到 ~7ms
+- 根因是 DP coordination 将 CUDA graph 模式从 FULL 降级为 NONE（eager mode）
+- 修复后所有 CP size 的 TPOT 均与 DP 基线对齐（~7ms vs 基线 9.58ms）
+
+### 2026-05-01 Session 5
+- 修复 CP=4/8 decode 性能回归（TPOT 80.61ms → ~7ms）
+  - 根因：`coordinate_batch_across_dp` 对所有 DP rank 取 cudagraph_mode 最小值，非 CP rank（0 tokens）dispatch 为 NONE 导致所有 rank 降级为 eager 模式
+  - 修复 3 处：dp_utils 忽略 0 tokens rank、gpu_model_runner 报告 FULL 模式、dispatch lambda cp_size 修正
+- 端到端验证：CP=1/2/4/8 单请求、2/4 并发 CP=4、混合 CP=1+CP=4 均通过
+- 下一步：运行正式 benchmark、清理 debug 代码、PD 分离测试
