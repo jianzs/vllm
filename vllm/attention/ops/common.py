@@ -276,10 +276,16 @@ def dycp_lse_out_ar(
     LSE sum into a single all-reduce, halving NCCL ops per layer vs
     cp_lse_ag_out_ar (which uses all_gather + all_reduce).
 
+    cp_attn_out: [B, H, D]
+    cp_attn_lse: [B, H] or [B, H, S] (S=1 for decode)
+
     global_output = sum_i(attn_out_i * exp(lse_i)) / sum_i(exp(lse_i))
     """
-    if cp_attn_lse is None:
+    if cp_attn_lse is None or cp_group.world_size == 1:
         return cp_attn_out
+    # FlashMLA returns lse as [B, H, S]; squeeze to [B, H] for decode (S=1)
+    if cp_attn_lse.ndim == 3 and cp_attn_lse.shape[-1] == 1:
+        cp_attn_lse = cp_attn_lse.squeeze(-1)
     lse_exp = torch.exp(cp_attn_lse)[:num_dycp_reqs]
     lse_exp_unsqueezed = lse_exp.unsqueeze(-1)
     weighted_output = cp_attn_out[:num_dycp_reqs] * lse_exp_unsqueezed

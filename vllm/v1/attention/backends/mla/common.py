@@ -3448,7 +3448,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                     is_lse_base_on_e=not getattr(self, "_use_fi_prefill", False),
                 )
             decode_dycp_reqs = min(attn_metadata.num_dycp_reqs, attn_metadata.num_decodes)
-            if decode_dycp_reqs > 0:
+            if decode_dycp_reqs > 0 and attn_metadata.actual_cp_size > 1:
                 cp_size = attn_metadata.actual_cp_size
                 dycp_group = (
                     get_dycp_subgroup(cp_size)
