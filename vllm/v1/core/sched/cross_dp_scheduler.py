@@ -794,6 +794,16 @@ class CrossDPScheduler(Scheduler):
             _deduct_budget(request.cp_ranks, num_new_tokens)
             req_index += 1
 
+        # DyCP: when CP>1 decode requests are running, avoid mixing
+        # prefill and decode across DP ranks in the same step. The MoE
+        # all-to-all forces all ranks to synchronize, so decode ranks
+        # would wait for slower prefill ranks, degrading TPOT from ~7ms
+        # to ~80ms. Instead, defer prefill to the next step.
+        dycp_has_cp_decode = (
+            self.dycp_enabled
+            and any(s > 1 for s in per_req_cp_sizes.values())
+        )
+
         # Use a temporary RequestQueue to collect requests that need to be
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
@@ -823,6 +833,13 @@ class CrossDPScheduler(Scheduler):
                     req_cp_size = get_cp_size_for_request(
                         num_prompt_tokens, self.dycp_sorted_thresholds
                     )
+                    # When CP>1 decode is already scheduled, defer new
+                    # prefill requests to avoid MoE all-to-all sync
+                    # bottleneck across mixed-phase DP ranks.
+                    if dycp_has_cp_decode and num_prompt_tokens > 0:
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
 
                 if len(request.cp_ranks) == 0:
                     selected_dp = self.request_manager.select_dp(
