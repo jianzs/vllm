@@ -207,4 +207,32 @@
   - 服务器启动正常，IPC handles 交换成功（27 layers × 8 ranks）
   - 短请求和长请求（CP=1/2/4/8）均正常返回
   - PD 的 IPC KV load 路径需要 proxy 才能触发，当前测试验证了初始化和基本功能
-- 下一步：运行 benchmark 对比 DyCP 性能与 DP 基线
+- 下一步：调查 CP=4/8 decode 性能回归根因，优化 NCCL 通信开销
+
+### Benchmark 结果（2026-05-01）
+
+**测试环境**: DeepSeek-V2-Lite, 8×GPU, dp_per_domain=8, FLASHMLA
+
+**DP Baseline（无 DyCP）**:
+| 场景 | Input | Output | TTFT P50 | TPOT P50 |
+|------|-------|--------|-----------|-----------|
+| Prefill | 4K | 1 | 33.70ms | - |
+| Decode | 4K | 1024 | 43.15ms | 9.58ms |
+
+**DyCP 结果**:
+| 场景 | Input | Output | CP Size | TTFT P50 | TPOT P50 | 备注 |
+|------|-------|--------|---------|-----------|-----------|------|
+| Prefill | 4K | 1 | CP=1 | 34.00ms | - | 与基线对齐 |
+| Decode | 4K | 1024 | CP=1 | 42.54ms | 9.38ms | 与基线对齐 |
+| Prefill | 8K | 1 | CP=2 | 52.59ms | - | 正常 |
+| Decode | 8K | 1024 | CP=2 | 61.36ms | 9.70ms | 与基线接近 |
+| Prefill | 20K | 1 | CP=4 | 119.97ms | - | 正常 |
+| Decode | 20K | 1024 | CP=4 | 148.56ms | 80.61ms | 性能回归！ |
+| Prefill | 40K | 1 | CP=8 | 272.70ms | - | 正常 |
+
+**关键发现**:
+- CP=1/2 的 prefill 和 decode 性能与 DP 基线对齐
+- CP=4/8 的 prefill 性能正常（TTFT 按预期增长）
+- CP=4 decode 性能严重回归（TPOT P50 80.61ms vs 基线 9.58ms，~8.4x 慢）
+- 可能原因：CP=4/8 decode 路径的 NCCL allgather/allreduce 通信开销过大
+- 需要进一步 profiling 确认瓶颈
