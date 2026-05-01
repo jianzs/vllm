@@ -168,9 +168,21 @@
 
 #### 待完成
 
-- 运行正式 benchmark 对比 DyCP 性能与 DP 基线（vllm bench serve）
-- 清理 debug timing 代码
+- 运行正式 benchmark 对比 DyCP 性能与 DP 基线（vllm bench serve）— 进行中
 - PD 分离端到端测试（需要 proxy 路由 prefill/decode 请求）
+- 解决 MoE all-to-all 同步瓶颈：调度器需要避免在同一 step 中混合 prefill 和 decode 到不同 DP rank
+
+### 2026-05-01 Session 7
+- 实现独立 CUDA graph 模式修复：DyCP 模式下各 CP 子组使用本地 `cudagraph_mode_for_dp` 而非全局 `synced_cudagraph_mode`，避免 prefill 子组降级 decode 子组的 CUDA graph 模式
+- 修复 DP coordination 后 `num_tokens_padded` 非 capture size 导致的 dispatch mismatch：DyCP 模式下将 `num_tokens_padded` 向上取整到最近的 CUDA graph capture size，并同步更新 `num_tokens_across_dp`
+- **测试结果**：
+  - 单请求 CP=4 decode：TTFT=90ms, streaming TPOT=9ms — 性能正常
+  - 2 并发 CP=4 decode：TTFT=85/143ms, streaming TPOT=150ms — 性能回归
+  - 正式 benchmark（32 prompts, max-concurrency=2）：0 failed, TPOT P50=81ms
+- **关键发现**：独立 CUDA graph 模式修复是正确的（dispatch 日志确认 decode rank 使用 FULL 模式），但 TPOT 仍然为 81ms
+- **根因**：调度器在同一 step 中将 prefill（KV loading）和 decode 混合调度到不同 DP rank。Ranks [0,1,2,3] 做 decode（1 token, CUDA graph），Ranks [4,5,6,7] 做 prefill（8 tokens, eager）。MoE all-to-all 强制所有 rank 同步，decode rank 必须等待 prefill rank 完成（~70ms），导致每步 81ms
+- **这是调度器级别的问题**，不是 GPU model runner 的问题。需要修改 CrossDPScheduler 避免在同一 step 中混合 prefill 和 decode 到不同 DP rank
+- 文件修改：`gpu_model_runner.py`（独立 CUDA graph 模式 + num_tokens_padded 取整 + num_tokens_across_dp 同步更新）
 
 ## 会话记录
 
