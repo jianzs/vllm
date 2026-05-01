@@ -207,7 +207,15 @@
   - 服务器启动正常，IPC handles 交换成功（27 layers × 8 ranks）
   - 短请求和长请求（CP=1/2/4/8）均正常返回
   - PD 的 IPC KV load 路径需要 proxy 才能触发，当前测试验证了初始化和基本功能
-- 下一步：调查 CP=4/8 decode 性能回归根因，优化 NCCL 通信开销
+- 下一步：深入 profiling 分析 CP=4/8 decode 性能回归根因（NCCL 融合未显著改善，瓶颈在其他地方）
+
+#### 性能优化尝试
+
+19. **修复 `dycp_lse_out_ar` bug 并切换 DyCP decode 到融合 all-reduce** ✓ 已完成
+    - Bug：`global_output = weighted_output / lse_exp` 应为 `global_output = global_weighted / global_lse_sum`
+    - 优化：将 DyCP decode 路径从 `cp_lse_ag_out_ar`（2 NCCL ops）切换到 `dycp_lse_out_ar`（1 NCCL op）
+    - 文件：`common.py`, `mla/common.py`, `flash_attn.py`, `flashinfer.py`
+    - 结果：TPOT 从 80.61ms 降到 81.55ms，几乎无改善，说明 NCCL 通信不是主要瓶颈
 
 ### Benchmark 结果（2026-05-01）
 
