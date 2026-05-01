@@ -300,12 +300,14 @@ class PCPManager:
             positions,
         )
 
-    def get_logits_indices(self, cu_num_tokens: np.ndarray, num_reqs: int):
+    def get_logits_indices(self, cu_num_tokens: np.ndarray, num_reqs: int,
+                           effective_world_size: int | None = None):
         if num_reqs == 0 or len(cu_num_tokens) == 0:
             return torch.empty((0,), dtype=torch.int64, device=self.device)
         num_pads = self.num_pcp_pads_cpu_tensor[:num_reqs].to(self.device)
+        world_size = effective_world_size if effective_world_size is not None else self.pcp_world_size
         return (
-            torch.from_numpy(cu_num_tokens).to(self.device) * self.pcp_world_size
+            torch.from_numpy(cu_num_tokens).to(self.device) * world_size
             - num_pads
             - 1
         )
@@ -316,12 +318,14 @@ class PCPManager:
         num_scheduled_tokens: np.ndarray,
         num_reqs: int,
         num_tokens_np: np.ndarray,
+        effective_world_size: int | None = None,
     ):
         if num_reqs == 0 or len(num_scheduled_tokens) == 0:
             return np.array([], dtype=bool)
+        world_size = effective_world_size if effective_world_size is not None else self.pcp_world_size
         return (
             num_computed_tokens_cpu[:num_reqs]
-            + num_scheduled_tokens * self.pcp_world_size
+            + num_scheduled_tokens * world_size
             - self.num_pcp_pads_cpu[:num_reqs]
         ) < num_tokens_np
 

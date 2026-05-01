@@ -1112,6 +1112,10 @@ class CrossDPScheduler(Scheduler):
 
         # DyCP: compute batch-level actual_cp_size (max across all scheduled reqs)
         actual_cp_size = max(per_req_cp_sizes.values()) if per_req_cp_sizes else 1
+        if self.dycp_enabled and actual_cp_size > 1:
+            logger.debug("DyCP: actual_cp_size=%d, per_req_cp_sizes=%s",
+                         actual_cp_size,
+                         {k: v for k, v in per_req_cp_sizes.items() if v > 1})
 
         for idx in range(self.cp_world_size):
             

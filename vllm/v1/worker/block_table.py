@@ -6,6 +6,7 @@ import torch
 
 from vllm.distributed import get_dycp_group, get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
+from vllm.config import get_current_vllm_config
 from vllm.utils.math_utils import cdiv
 from vllm.v1.utils import CpuGpuBuffer
 
@@ -408,12 +409,32 @@ class MultiGroupBlockTable:
 
         total_cp_world_size = dcp_world_size * pcp_world_size * dycp_world_size
 
+        # DyCP: when DyCP is enabled, the effective cp_world_size per request
+        # can be smaller than total_cp_world_size. Smaller cp_size means each
+        # rank stores more local blocks, so max_num_blocks_per_req must be
+        # computed using the minimum possible cp_size.
+        if dycp_world_size > 1:
+            from vllm.config.parallel import ParallelConfig
+            try:
+                vllm_config = get_current_vllm_config()
+                dycp_cp_sizes = vllm_config.parallel_config.dycp_all_cp_sizes
+                # Use the minimum cp_size (including 1) for block table sizing.
+                # cp_size=1 means no CP, requiring the most blocks per request.
+                min_cp_size = min(dycp_cp_sizes) if dycp_cp_sizes else 1
+                effective_cp_world_size = (
+                    dcp_world_size * pcp_world_size * min_cp_size
+                )
+            except Exception:
+                effective_cp_world_size = total_cp_world_size
+        else:
+            effective_cp_world_size = total_cp_world_size
+
         self.block_tables = [
             BlockTable(
                 block_size,
                 max_num_reqs,
                 max(
-                    cdiv(max_model_len, block_size * total_cp_world_size),
+                    cdiv(max_model_len, block_size * effective_cp_world_size),
                     1 + num_speculative_tokens,
                 ),
                 max_num_batched_tokens,

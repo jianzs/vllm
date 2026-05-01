@@ -1684,6 +1684,7 @@ class GPUModelRunner(
                     num_scheduled_tokens=num_scheduled_tokens[:num_dycp_reqs],
                     num_reqs=num_dycp_reqs,
                     num_tokens_np=num_tokens_np[:num_dycp_reqs],
+                    effective_world_size=scheduler_output.actual_cp_size,
                 )
             )
             if num_dycp_reqs < num_reqs:
@@ -1734,14 +1735,15 @@ class GPUModelRunner(
             elif self.dycp_world_size > 1 and scheduler_output.num_cp_request > 0 and dycp_has_prefill:
                 num_dycp_tokens = sum(num_scheduled_tokens[:num_dycp_reqs])
                 logits_indices[:num_dycp_reqs] = self.pcp_manager.get_logits_indices(
-                    cu_num_tokens[:num_dycp_reqs], num_dycp_reqs
+                    cu_num_tokens[:num_dycp_reqs], num_dycp_reqs,
+                    effective_world_size=scheduler_output.actual_cp_size,
                 )
                 if num_dycp_reqs < num_reqs:
                     # NOTE: restored hidden_states still include padded DYCP
                     # slots, so the DP part should be shifted by gathered
                     # (padded) DYCP size rather than unpadded size.
                     dycp_allgathered_size = (
-                        cu_num_tokens[num_dycp_reqs - 1] * self.dycp_world_size
+                        cu_num_tokens[num_dycp_reqs - 1] * scheduler_output.actual_cp_size
                     )
                     logits_indices[num_dycp_reqs:] += (dycp_allgathered_size - num_dycp_tokens)
             num_draft_tokens = None
@@ -1945,8 +1947,8 @@ class GPUModelRunner(
             else:
                 self.cp_local_seq_lens.cpu[:num_dycp_reqs] = get_cp_local_seq_lens(
                     self.seq_lens.cpu[:num_dycp_reqs],
-                    self.dycp_world_size,
-                    self.dycp_rank,
+                    actual_cp_size,
+                    self.dycp_rank % actual_cp_size,
                     self.parallel_config.cp_kv_cache_interleave_size,
                 )
             self.cp_local_seq_lens.cpu[num_dycp_reqs:num_reqs].copy_(self.seq_lens.cpu[num_dycp_reqs:num_reqs])
@@ -1988,7 +1990,7 @@ class GPUModelRunner(
             # num_dycp_tokens == num_dycp_reqs (1 token per request).
             _dycp_has_prefill = num_dycp_tokens > num_dycp_reqs
             if num_dycp_tokens > 0 and _dycp_has_prefill:
-                dycp_allgather_size = num_dycp_tokens * self.dycp_world_size
+                dycp_allgather_size = num_dycp_tokens * actual_cp_size
                 cm_base.pcp_allgather_restore_idx = self.pcp_manager.pcp_allgather_restore_idx.gpu[
                     :dycp_allgather_size
                 ]
@@ -3166,7 +3168,7 @@ class GPUModelRunner(
         uniform_decode = (
             (
                 (max_num_scheduled_tokens == self.uniform_decode_query_len)
-                and (num_tokens_padded == max_num_scheduled_tokens * num_reqs)
+                and (num_tokens == max_num_scheduled_tokens * num_reqs)
             )
             if force_uniform_decode is None
             else force_uniform_decode
@@ -3190,7 +3192,7 @@ class GPUModelRunner(
                 uniform_decode=uniform_decode,
                 disable_full=disable_full,
                 num_cp_tokens=num_cp_tokens,
-                cp_size=actual_cp_size,
+                cp_size=actual_cp_size if num_cp_tokens > 0 else 1,
             )
             if not force_eager
             else (CUDAGraphMode.NONE, BatchDescriptor(num_tokens_padded))
@@ -3216,6 +3218,15 @@ class GPUModelRunner(
                 or self.parallel_config.enable_expert_parallel
             )
 
+            # When DyCP is active and this rank has 0 tokens, report FULL mode
+            # to DP coordination so that non-CP ranks don't downgrade CP ranks'
+            # CUDA graph mode. After DP padding, all ranks have the same token
+            # count and can use FULL mode.
+            cudagraph_mode_for_dp = cudagraph_mode.value
+            if (self.dycp_world_size > 1 and num_tokens == 0
+                    and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE):
+                cudagraph_mode_for_dp = CUDAGraphMode.FULL.value
+
             should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
                 coordinate_batch_across_dp(
                     num_tokens_unpadded=num_tokens,
@@ -3225,7 +3236,7 @@ class GPUModelRunner(
                     num_tokens_padded=num_tokens_padded,
                     uniform_decode=uniform_decode,
                     num_scheduled_tokens_per_request=num_scheduled_tokens_np,
-                    cudagraph_mode=cudagraph_mode.value,
+                    cudagraph_mode=cudagraph_mode_for_dp,
                 )
             )
 
@@ -3233,10 +3244,17 @@ class GPUModelRunner(
             if num_tokens_across_dp is not None:
                 dp_rank = self.parallel_config.data_parallel_rank
                 num_tokens_padded = int(num_tokens_across_dp[dp_rank].item())
+                disable_full = synced_cudagraph_mode <= CUDAGraphMode.PIECEWISE.value
+                # When DyCP is active and this rank has 0 original tokens but
+                # is DP-padded, set uniform_decode=True so the dispatch finds
+                # the correct CUDA graph key for non-CP decode.
+                if (self.dycp_world_size > 1 and num_tokens == 0
+                        and num_tokens_padded > 0):
+                    uniform_decode = True
                 # Re-dispatch with DP padding so we have the correct batch_descriptor
                 cudagraph_mode, batch_descriptor = dispatch_cudagraph(
                     num_tokens_padded,
-                    disable_full=synced_cudagraph_mode <= CUDAGraphMode.PIECEWISE.value,
+                    disable_full=disable_full,
                 )
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
