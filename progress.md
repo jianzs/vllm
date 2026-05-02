@@ -169,13 +169,16 @@
 #### 待完成
 
 - ~~运行正式 benchmark 对比 DyCP 性能与 DP 基线（vllm bench serve）~~ — Decode + Prefill benchmark 均已完成
-- PD 分离端到端测试：修复了 3 个 KV loading bug（见 Session 10），需在远程机器上验证
+- ~~PD 分离端到端测试~~ — CP=1/4/8 PD 输出正确性已验证（Session 15）
 - ~~解决 MoE all-to-all 同步瓶颈~~ — 已修复（纯同一 CP size 场景），混合 CP size 场景为设计预期
 - ~~运行 Prefill benchmark（不带 --kv-transfer-config，output=1）~~ — 已完成（Session 9）
 - 混合 CP size 负载的 TPOT 回归问题：需要真实 PD 部署验证（CrossDPExampleConnector 的 KV loading 走完整前向传播，不是真实场景）
 - **模型输出异常**：`VLLM_USE_FORCE_LOAD_BALANCE=1` 导致模型输出重复 token（点号、感叹号等），与 DyCP 代码无关
   - 解决方案：移除 `VLLM_USE_FORCE_LOAD_BALANCE=1` 环境变量
   - 已更新 `start_vllm_pd_dycp.sh`，移除该变量并将 `gpu-memory-utilization` 从 0.80 改为 0.70
+- PD 分离性能 benchmark（TTFT/TPOT）
+- 混合 CP size PD 负载测试
+- 长时间稳定性测试
 
 ### 2026-05-01 Session 7
 - 实现独立 CUDA graph 模式修复：DyCP 模式下各 CP 子组使用本地 `cudagraph_mode_for_dp` 而非全局 `synced_cudagraph_mode`，避免 prefill 子组降级 decode 子组的 CUDA graph 模式
@@ -516,6 +519,39 @@
 - 问题：decode 阶段没有正确使用 prefill 的 KV cache，与 Session 10 发现的问题一致
 - 需要进一步调试 `_start_load_kv_ipc` 方法，检查 KV 数据是否正确加载到 decode 请求的 paged cache
 
+### 2026-05-02 Session 14
+- 恢复上下文，继续调试 PD 输出正确性
+- **修复 1：Proxy 响应格式 bug**（`dycp/proxy/local_pd_proxy.py`）
+  - 根因：proxy 将 decode 请求从 `/v1/chat/completions` 切换到 `/v1/completions`（为跳过 re-tokenization），但 completions API 返回 `choices[0].text` 而客户端期望 `choices[0].message.content`
+  - 修复：移除 endpoint 切换逻辑，decode 请求始终使用原始 endpoint
+- **修复 2：`_cross_requests_need_load` 无条件清空 bug**（`local_pd_connector.py:715`）
+  - 根因：`build_connector_meta` 结尾 `self._cross_requests_need_load[cp_rank].clear()` 无条件清空，即使已注册的 decode 请求尚未被调度
+  - 时序：`update_state_after_alloc` 注册 load → 中间多个 `build_connector_meta` 调用清空 dict → decode 请求被调度时 `_cross_requests_need_load` 已空
+  - 修复：改为只移除已处理的请求（`processed_req_ids`），保留未调度的请求到下一 step
+- **CP=1 PD 验证通过**：direct vs proxy 输出完全一致
+  - 4800 token prompt（CP=1）：两者都返回 "The capital of France is Paris."
+  - 10519 token prompt（CP=1）：两者输出一致
+- **CP>1 PD 输出仍不正确**：direct vs proxy 输出不同
+  - 64025 token prompt（CP=8）：direct 返回 "France France France..."，proxy 返回 "France and Luxembourg..."
+  - IPC KV VERIFY 显示 `match=True diff=0` — KV 数据正确加载
+  - **关键发现**：PD decode 请求被调度为 `cp_size=8` 而非 `cp_size=1`
+  - `dycp_decode_meta` 显示 `rank=0 cp_size=8 seq_lens=[64054] cp_local=[8054] num_computed=[64053]`
+  - 但 IPC 只将 KV 加载到 rank 0，其他 7 个 rank 没有 KV 数据
+  - 调度器代码（`cross_dp_scheduler.py:857-858`）已设置 `req_cp_size=1`，但 batch-level `actual_cp_size=8`
+  - **根因假设**：batch 中同时存在 CP=8 prefill 请求和 CP=1 PD decode 请求，`actual_cp_size = max(per_req_cp_sizes.values()) = 8`
+  - 或者：PD decode 请求在 prefill 还未完成的 batch 中被调度，继承了 batch 的 CP=8
+- **修复 3（待验证）：PD decode 请求与 CP>1 prefill 互斥调度**（`cross_dp_scheduler.py`）
+  - 添加 `dycp_has_cp_prefill` 标志：检测是否有 CP>1 prefill 请求正在运行
+  - 当 `dycp_has_cp_prefill=True` 时，延迟 PD decode 请求（`do_remote_prefill`）
+  - 确保 PD decode 请求在独立的 CP=1 batch 中调度
+  - 与已有的 `dycp_has_decode` 逻辑对称（decode 运行时延迟 prefill）
+- SSH 连接断开，远程调试暂停
+- 下一步：
+  1. ~~确认 PD decode 请求的 batch-level CP size 为何是 8~~ — 已确认，batch 混合 CP>1 prefill 和 CP=1 decode
+  2. ~~确保 PD decode 请求在独立的 CP=1 batch 中调度~~ — 已修复（dycp_has_cp_prefill 检查）
+  3. ~~或者：将 KV 加载到所有 8 个 rank（而非仅 rank 0）~~ — 不需要，CP=1 decode 只需 rank 0
+  4. ~~验证 CP>1 PD 输出正确性~~ — 已验证通过（Session 15）
+
 ### 2026-05-02 Session 13
 - 恢复上下文，继续调试 CP>1 PD 输出正确性问题
 - 修复 2 个已确认的 bug（上一 session 修复但未 commit）：
@@ -537,6 +573,25 @@
   - `gpu_model_runner.py`：记录 actual_cp_size、per_req_cp_sizes
 - 远程机器不可用，无法运行测试验证
 - 下一步：远程可用后运行 CP>1 PD 测试，分析诊断日志定位根因
+
+### 2026-05-02 Session 15
+- 恢复上下文，分析未提交代码变更（Session 13-14 的修复和诊断代码）
+- 清理诊断代码，保留核心修复，提交 commit `ac42ab038`
+- 核心修复内容：
+  1. **Second cache write**（gpu_model_runner.py, mla/common.py, utils.py）：DyCP prefill 后 allgather 使每个 rank 拥有完整 KV，但 paged cache 只写入了 DualChunkSwap 交集位置。新增 `dync_full_interleave_slot_mapping` 在 allgather 后写入所有 interleave 位置，确保 IPC load 读取完整 KV 数据
+  2. **PD decode 与 CP>1 prefill 互斥调度**（cross_dp_scheduler.py）：添加 `dycp_has_cp_prefill` 检查，当 CP>1 prefill 运行时延迟 PD decode 请求，避免 batch-level `actual_cp_size` 被强制提升
+  3. **`_cross_requests_need_load` 无条件清空 bug**（local_pd_connector.py）：改为只移除已处理的请求，保留未调度请求到下一 step
+  4. **Proxy 响应格式修复**（local_pd_proxy.py）：移除 endpoint 切换逻辑，decode 请求始终使用原始 endpoint
+- **CP>1 PD 分离端到端验证通过**：
+  - CP=1 PD（~5K tokens）：输出与 Direct 一致 ✓
+  - CP=4 PD（~20K tokens）：输出与 Direct 一致 ✓
+  - CP=8 PD（~40K tokens）：输出与 Direct 一致 ✓
+  - 测试方法：相同 prompt 分别通过 proxy（PD 流程）和直接请求 vLLM，比较 `max_tokens=1` 输出
+- 下一步：
+  1. 运行正式 PD benchmark（TTFT/TPOT 性能数据）
+  2. 混合 CP size 负载测试（CP=1 + CP=4 + CP=8 并发）
+  3. 长时间稳定性测试
+  4. 清理剩余诊断代码和 TODO
 
 ### 2026-05-01 Session 5
 - 修复 CP=4/8 decode 性能回归（TPOT 80.61ms → ~7ms）
