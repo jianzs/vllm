@@ -176,7 +176,7 @@
 - **模型输出异常**：`VLLM_USE_FORCE_LOAD_BALANCE=1` 导致模型输出重复 token（点号、感叹号等），与 DyCP 代码无关
   - 解决方案：移除 `VLLM_USE_FORCE_LOAD_BALANCE=1` 环境变量
   - 已更新 `start_vllm_pd_dycp.sh`，移除该变量并将 `gpu-memory-utilization` 从 0.80 改为 0.70
-- PD 分离性能 benchmark（TTFT/TPOT）
+- PD 分离性能 benchmark（TTFT/TPOT）— 进行中（Session 16）
 - 混合 CP size PD 负载测试
 - 长时间稳定性测试
 
@@ -611,6 +611,42 @@
 | PD | ~5K | CP=1 | " the" | " the" | ✓ |
 | PD | ~20K | CP=4 | " the" | " the" | ✓ |
 | PD | ~40K | CP=8 | " Rome" | " Rome" | ✓ |
+
+### 2026-05-02 Session 16
+- 恢复上下文，评估当前状态：PD 分离正确性已验证，需要运行正式 PD benchmark
+- 发现并修复 Proxy PD 路由 bug：
+  - **问题**：`sync.sh` 排除了 `dycp/` 目录，导致 proxy 代码未同步到远程。旧版 proxy 代码缺少 Session 13-14 的修复
+  - **问题**：Proxy 的 `_estimate_token_count` 对 benchmark 请求（`--use-local-json` 生成的短消息）估算不足（~12 tokens），低于 threshold 100，导致所有请求被路由为 direct（非 PD）
+  - **修复**：1) 手动同步 `dycp/` 目录到远程；2) 设置 `VLLM_LONG_REQUEST_THRESHOLD=1` 使所有请求走 PD 流程
+  - **验证**：手动测试确认 PD 流程正常工作（prefill store KV → decode load KV → 输出正确）
+- 添加 proxy 调试输出（`[PROXY DISPATCH]` 和 `[PROXY PD]` print 语句）
+- 发现 PD decode 并发 TTFT 回归问题：
+  - **根因**：`dycp_has_decode` 调度器检查在前一个请求的 decode 完成前延迟下一个 prefill，导致串行化
+  - **影响**：concurrency=2 时 TTFT P50=9996ms（10 秒），concurrency=1 时 TTFT P50=336ms
+  - **这是设计预期**：Local PD（同一实例）的 prefill/decode 互斥调度是避免 MoE all-to-all 同步瓶颈的必要措施
+  - **真实 PD 部署**（独立 prefill/decode 实例）不会出现此问题
+- 完成 PD benchmark（concurrency=1，避免调度器序列化）
+
+**PD Prefill Benchmark（16 prompts, concurrency=1, request-rate=1, output=1）**:
+| 场景 | Input | CP Size | TTFT P50 | 备注 |
+|------|-------|---------|-----------|------|
+| PD Prefill | 4K | CP=1 | 346ms | 与 CrossDP 基线（285ms）接近 |
+| PD Prefill | 20K | CP=4 | 627ms | CP 开销合理 |
+| PD Prefill | 40K | CP=8 | 949ms | CP 开销合理 |
+
+**PD Decode Benchmark（4 prompts, concurrency=1, request-rate=1, output=1024）**:
+| 场景 | Input | CP Size | TTFT P50 | TPOT P50 | 备注 |
+|------|-------|---------|-----------|-----------|------|
+| PD Decode | 4K | CP=1 | 336ms | 9.20ms | TPOT 与 DP 基线对齐 |
+| PD Decode | 20K | CP=4 | 632ms | 9.82ms | TPOT 与 DP 基线对齐 |
+| PD Decode | 40K | CP=8 | 949ms | 10.24ms | TPOT 略高于基线（+0.7ms） |
+
+**关键发现**:
+- PD TPOT 在所有 CP size 下与 DP 基线对齐（~9-10ms），PD 流程不影响 decode 性能
+- PD TTFT 包含 prefill 时间 + KV transfer 时间，随 CP size 增长合理
+- CP=8 decode TPOT 为 10.24ms，比 CP=1（9.20ms）高约 1ms，可能是 CP=8 的 KV loading 开销
+- 并发 PD decode 的 TTFT 受调度器互斥限制（dync_has_decode），这是 Local PD 的设计预期
+- 下一步：混合 CP size 测试、代码清理、移除 proxy 调试输出
 
 ### 2026-05-01 Session 5
 - 修复 CP=4/8 decode 性能回归（TPOT 80.61ms → ~7ms）
