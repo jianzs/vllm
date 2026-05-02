@@ -442,6 +442,7 @@ class MLACommonMetadata(Generic[D]):
     num_dycp_reqs: int = 0
     num_dycp_tokens: int = 0
     actual_cp_size: int = 1
+    dycp_full_interleave_slot_mapping: torch.Tensor | None = None
 
     # Pre-split metadata for mixed DyCP+DP batches.
     # Built once in build(), reused across all layers in forward().
@@ -1715,6 +1716,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             num_dycp_reqs=num_dycp_reqs,
             num_dycp_tokens=num_dycp_tokens,
             actual_cp_size=common_attn_metadata.actual_cp_size,
+            dycp_full_interleave_slot_mapping=common_attn_metadata.dycp_full_interleave_slot_mapping,
         )
 
         # Pre-build split metadata for mixed DyCP+DP batches.
@@ -1770,6 +1772,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 pcp_allgather_restore_idx=pcp_allgather_restore_idx,
                 num_dycp_reqs=n_dycp_prefill,
                 num_dycp_tokens=dycp_token_end,
+                dycp_full_interleave_slot_mapping=common_attn_metadata.dycp_full_interleave_slot_mapping,
             )
 
             attn_metadata._dp_split = self.metadata_cls(
@@ -1788,6 +1791,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 pcp_allgather_restore_idx=None,
                 num_dycp_reqs=0,
                 num_dycp_tokens=0,
+                dycp_full_interleave_slot_mapping=None,
             )
 
         return attn_metadata
@@ -3288,6 +3292,37 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 dycp_group,
             )
             dycp_kv_gathered = True
+
+            # Second cache write: after allgather, each rank has full KV
+            # for all positions. Write ALL interleave-assigned positions
+            # to paged cache — the first write only covers the
+            # intersection of DualChunkSwap and interleave positions.
+            full_sm = attn_metadata.dycp_full_interleave_slot_mapping
+            if full_sm is not None and kv_cache.numel() > 0:
+                gathered_toks = k_c_normed.shape[0]
+                write_toks = min(
+                    gathered_toks,
+                    int(k_pe.shape[0]),
+                    int(full_sm.shape[0]),
+                )
+                if write_toks > 0:
+                    max_slot = full_sm[:write_toks].max().item()
+                    kv_slots = kv_cache.shape[0] * kv_cache.shape[1]
+                    if max_slot < kv_slots:
+                        ops.concat_and_cache_mla(
+                            k_c_normed[:write_toks].clone(),
+                            k_pe[:write_toks].squeeze(1).clone(),
+                            kv_cache,
+                            full_sm[:write_toks],
+                            kv_cache_dtype=self.kv_cache_dtype,
+                            scale=layer._k_scale,
+                        )
+                    else:
+                        logger.error(
+                            "dycp second cache write SKIPPED: "
+                            "max_slot=%d >= kv_slots=%d",
+                            max_slot, kv_slots,
+                        )
 
 
         # Inputs and outputs may be padded for CUDA graphs

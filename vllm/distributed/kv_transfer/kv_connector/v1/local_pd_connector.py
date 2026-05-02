@@ -518,12 +518,13 @@ class LocalPDConnector(KVConnectorBase_V1):
         cp_rank = scheduler_output.cp_rank
 
         if cp_rank == 0:
-            logger.info(
-                "build_connector_meta START: _prefill_requests=%s, "
-                "new_reqs=%d, num_sched=%s",
-                list(self._prefill_requests.keys())[:3],
+            need_load_keys = list(self._cross_requests_need_load[cp_rank].keys())
+            logger.debug(
+                "build_connector_meta: prefill=%d, need_load=%d, "
+                "new_reqs=%d",
+                len(self._prefill_requests),
+                len(need_load_keys),
                 len(scheduler_output.scheduled_new_reqs),
-                list(scheduler_output.num_scheduled_tokens.keys())[:3],
             )
 
         for new_req in scheduler_output.scheduled_new_reqs:
@@ -542,14 +543,11 @@ class LocalPDConnector(KVConnectorBase_V1):
                 # Diagnostic: log decode request block allocation
                 decode_block_ids = new_req.block_ids[0]
                 num_computed = new_req.num_computed_tokens
-                logger.info(
-                    "PD decode req=%s: num_computed_tokens=%d, "
-                    "num_blocks=%d, block_ids[:5]=%s, "
-                    "cp_rank=%d, pd_prefix=%s",
+                logger.debug(
+                    "PD decode req=%s: num_computed=%d, blocks=%d, "
+                    "cp_rank=%d",
                     new_req.req_id, num_computed,
-                    len(decode_block_ids),
-                    decode_block_ids[:5] if decode_block_ids else [],
-                    cp_rank, pd_prefix,
+                    len(decode_block_ids), cp_rank,
                 )
                 meta.add_request(
                     req_id=new_req.req_id,
@@ -702,17 +700,21 @@ class LocalPDConnector(KVConnectorBase_V1):
             cp_rank, store_count, load_count,
         )
 
-        expected = len(self._cross_requests_need_load[cp_rank])
-        if total_need_load != expected:
-            logger.warning(
-                "LocalPDConnector: need_load mismatch on cp_rank=%d: "
-                "total_need_load=%d, expected=%d. "
-                "Some requests may not have been scheduled this step.",
-                cp_rank,
-                total_need_load,
-                expected,
+        # Only remove requests that were actually processed this step.
+        # Unconditionally clearing loses registrations for requests that
+        # haven't been scheduled yet (e.g., decode requests waiting for
+        # a scheduling slot after their prefill completed).
+        processed_req_ids = {r.req_id for r in meta.requests if not r.is_store}
+        for req_id in processed_req_ids:
+            self._cross_requests_need_load[cp_rank].pop(req_id, None)
+        remaining = len(self._cross_requests_need_load[cp_rank])
+        if remaining > 0:
+            logger.info(
+                "build_connector_meta cp_rank=%d: %d load requests remain "
+                "for next step: %s",
+                cp_rank, remaining,
+                list(self._cross_requests_need_load[cp_rank].keys())[:5],
             )
-        self._cross_requests_need_load[cp_rank].clear()
         return meta
 
     def request_finished(
@@ -1111,22 +1113,6 @@ class LocalPDConnector(KVConnectorBase_V1):
         )
 
         elapsed = (_time.monotonic() - t0) * 1000
-        # Debug: log first few copy pairs per rank for CP>1
-        if cp_world_size > 1:
-            debug_copies = {}
-            for sr, pairs in per_rank_copies.items():
-                debug_copies[sr] = pairs[:3]
-            logger.info(
-                "IPC KV debug for prefix=%s: cp_world_size=%d, "
-                "actual_tokens=%d, dst_slot_mapping[0:5]=%s, "
-                "per_rank_copies(first3)=%s, "
-                "owning_ranks[0:10]=%s, block_indices[0:10]=%s",
-                prefix, cp_world_size, actual_tokens,
-                dst_slot_mapping[:5].tolist(),
-                debug_copies,
-                owning_ranks[:10].tolist(),
-                block_indices[:10].tolist(),
-            )
         logger.info(
             "IPC KV async launched for prefix=%s: %d layers, %d tokens "
             "from %d ranks (prefill_ranks=%s, decode_rank=%d) in %.1fms "

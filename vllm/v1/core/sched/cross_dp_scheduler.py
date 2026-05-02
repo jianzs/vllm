@@ -815,6 +815,17 @@ class CrossDPScheduler(Scheduler):
                 for req in self.running
             )
         )
+        # Check if any running request is a CP>1 prefill (still computing
+        # prompt tokens). PD decode requests must wait for these to finish
+        # to avoid being forced into a CP>1 batch.
+        dycp_has_cp_prefill = (
+            self.dycp_enabled
+            and any(
+                len(req.cp_ranks) > 1
+                and req.num_computed_tokens < req.num_prompt_tokens
+                for req in self.running
+            )
+        )
 
         # Use a temporary RequestQueue to collect requests that need to be
         # skipped and put back at the head of the waiting queue later
@@ -860,6 +871,14 @@ class CrossDPScheduler(Scheduler):
                     # requests to avoid MoE all-to-all sync bottleneck
                     # across mixed-phase DP ranks.
                     if dycp_has_decode and num_prompt_tokens > 0:
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
+                    # When CP>1 prefill is running, defer PD decode requests.
+                    # PD decode runs with CP=1 (KV loaded to a single rank),
+                    # but mixing it in a CP>1 batch forces wrong actual_cp_size.
+                    if (kv_params and kv_params.get("do_remote_prefill")
+                            and dycp_has_cp_prefill):
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
                         continue

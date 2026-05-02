@@ -2011,6 +2011,85 @@ class GPUModelRunner(
             cm_base.dycp_local_seq_lens = cm_base.cp_local_seq_lens
             cm_base.dycp_local_seq_lens_cpu = cm_base.cp_local_seq_lens_cpu
 
+            # Compute full interleave slot_mapping for allgathered KV.
+            # DualChunkSwap assigns positions for compute load balancing, but
+            # the interleave-based slot_mapping only writes the intersection of
+            # DualChunkSwap and interleave positions. After KV allgather, each
+            # rank has full KV data — this slot_mapping writes ALL interleave-
+            # assigned positions to paged cache so decode can read them via IPC.
+            if _dycp_has_prefill and actual_cp_size > 1:
+                qsl_cpu = self.query_start_loc.cpu[:num_dycp_reqs + 1]
+                local_tokens_np = (
+                    qsl_cpu[1:num_dycp_reqs + 1] - qsl_cpu[:num_dycp_reqs]
+                )
+                if isinstance(local_tokens_np, torch.Tensor):
+                    local_tokens_np = local_tokens_np.numpy()
+                local_tokens_np = local_tokens_np.astype(np.int64)
+                padded_seq_lens_np = local_tokens_np * actual_cp_size
+                num_pcp_pads_np = (
+                    self.pcp_manager.num_pcp_pads_cpu[:num_dycp_reqs]
+                )
+                if isinstance(num_pcp_pads_np, torch.Tensor):
+                    num_pcp_pads_np = num_pcp_pads_np.numpy()
+                real_seq_lens_np = padded_seq_lens_np - num_pcp_pads_np
+                cumsum_padded = np.cumsum(padded_seq_lens_np)
+                total_padded = int(cumsum_padded[-1])
+
+                block_size = self.cache_config.block_size
+                interleave_size = (
+                    self.parallel_config.cp_kv_cache_interleave_size
+                )
+                blk_table = self.input_batch.block_table[0]
+                num_computed_np = (
+                    self.input_batch.num_computed_tokens_cpu[:num_dycp_reqs]
+                )
+                if isinstance(num_computed_np, torch.Tensor):
+                    num_computed_np = num_computed_np.numpy()
+                per_req_cp = self._per_req_cp_sizes_np
+                if per_req_cp is not None and num_dycp_reqs <= len(per_req_cp):
+                    cp_sizes_np = per_req_cp[:num_dycp_reqs]
+                else:
+                    cp_sizes_np = np.full(
+                        num_dycp_reqs, actual_cp_size, dtype=np.int32
+                    )
+
+                slot_mapping_np = np.full(total_padded, -1, dtype=np.int64)
+                for i in range(num_dycp_reqs):
+                    start = int(cumsum_padded[i - 1]) if i > 0 else 0
+                    end = int(cumsum_padded[i])
+                    cp_i = int(cp_sizes_np[i])
+                    rank_i = self.dycp_rank % cp_i
+                    real_len = int(real_seq_lens_np[i])
+                    comp_off = int(num_computed_np[i])
+
+                    rel_pos = np.arange(end - start, dtype=np.int64)
+                    abs_pos = rel_pos + comp_off
+
+                    vbs = block_size * cp_i
+                    vbo = abs_pos % vbs
+                    mask = (
+                        (vbo // interleave_size) % cp_i == rank_i
+                    ) & (rel_pos < real_len)
+
+                    bt_idx = (
+                        i * blk_table.max_num_blocks_per_req
+                        + abs_pos // vbs
+                    )
+                    bt_flat = blk_table.block_table.np.ravel()
+                    blk_nums = bt_flat[bt_idx]
+                    blk_off = (
+                        vbo // (cp_i * interleave_size) * interleave_size
+                        + vbo % interleave_size
+                    )
+                    slots = blk_nums * block_size + blk_off
+                    slot_mapping_np[start:end] = np.where(mask, slots, -1)
+
+                cm_base.dycp_full_interleave_slot_mapping = (
+                    torch.from_numpy(slot_mapping_np).to(
+                        device=self.device, dtype=torch.int64
+                    )
+                )
+
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)
             cm_base.logits_indices_padded = self._prepare_kv_sharing_fast_prefill(

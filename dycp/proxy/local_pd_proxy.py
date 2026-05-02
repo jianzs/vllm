@@ -257,14 +257,6 @@ def _build_decode_request(
             if key not in kv_params:
                 kv_params[key] = value
 
-        # Optimization: use token IDs from prefill to skip re-tokenization.
-        # Store token IDs for endpoint switching in _handle_pd_request.
-        prompt_token_ids = prefill_kv_params.get("prompt_token_ids")
-        if prompt_token_ids:
-            req["_use_token_ids"] = True
-            req["prompt"] = prompt_token_ids
-            req.pop("messages", None)
-
     req["kv_transfer_params"] = kv_params
     return req
 
@@ -397,10 +389,8 @@ async def _handle_pd_request(endpoint: str, request: Request):
     decode_req = _build_decode_request(original_body, prefix, prefill_kv_params)
     is_streaming = original_body.get("stream", False)
 
-    # Use /v1/completions for decode when token IDs available (skip tokenization)
+    # Use same endpoint as original request for decode
     decode_endpoint = endpoint
-    if decode_req.pop("_use_token_ids", False):
-        decode_endpoint = "/v1/completions"
 
     logger.info(
         "Starting decode [%s] endpoint=%s streaming=%s",
@@ -447,18 +437,14 @@ async def _dispatch_request(endpoint: str, request: Request):
     if estimated_tokens < threshold:
         request_id = f"direct-{uuid.uuid4().hex[:12]}"
         logger.info(
-            "Short request [%s] endpoint=%s model=%s "
-            "estimated_tokens=%d (< threshold=%d) -> direct forward",
-            request_id, endpoint, body.get("model", "unknown"),
-            estimated_tokens, threshold,
+            "Short request [%s] endpoint=%s estimated_tokens=%d -> direct",
+            request_id, endpoint, estimated_tokens,
         )
         return await _forward_direct(endpoint, body, request_id)
     else:
         logger.info(
-            "Long request endpoint=%s model=%s "
-            "estimated_tokens=%d (>= threshold=%d) -> PD two-phase",
-            endpoint, body.get("model", "unknown"),
-            estimated_tokens, threshold,
+            "Long request endpoint=%s estimated_tokens=%d -> PD two-phase",
+            endpoint, estimated_tokens,
         )
         return await _handle_pd_request_with_body(endpoint, body)
 
@@ -524,10 +510,8 @@ async def _handle_pd_request_with_body(endpoint: str, original_body: dict):
     )
     is_streaming = original_body.get("stream", False)
 
-    # Use /v1/completions for decode when token IDs available
+    # Use same endpoint as original request for decode
     decode_endpoint = endpoint
-    if decode_req.pop("_use_token_ids", False):
-        decode_endpoint = "/v1/completions"
 
     logger.info(
         "Starting decode [%s] endpoint=%s streaming=%s",

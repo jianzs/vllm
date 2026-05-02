@@ -117,6 +117,11 @@ class CommonAttentionMetadata:
     num_dycp_tokens: int = 0
     actual_cp_size: int = 1
 
+    dycp_full_interleave_slot_mapping: torch.Tensor | None = None
+    """Slot mapping for all interleave-assigned positions in the allgathered KV.
+    Used to write back full KV to paged cache after DyCP allgather, filling
+    positions missed by the DualChunkSwap-based first write."""
+
     @property
     @deprecated(
         """
