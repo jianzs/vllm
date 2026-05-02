@@ -593,6 +593,25 @@
   3. 长时间稳定性测试
   4. 清理剩余诊断代码和 TODO
 
+### Benchmark 结果（2026-05-02，Session 15 — PD 分离）
+
+**测试环境**: DeepSeek-V2-Lite, 8×GPU, dp_per_domain=8, FLASHMLA, LocalPDConnector + Proxy
+
+**PD 分离 Benchmark（16 prompts, max-concurrency=1/2, request-rate=1/2）**:
+| 场景 | Input | Output | CP Size | TTFT P50 | TPOT P50 | 备注 |
+|------|-------|--------|---------|-----------|-----------|------|
+| PD Prefill | 4K | 1 | CP=1 | 292ms | - | 与 DP 基线对齐 |
+| PD Prefill | 20K | 1 | CP=4 | 445ms | - | 与 CrossDP 基线对齐 |
+| PD Decode | 4K | 1024 | CP=1 | 459ms | 9.44ms | TPOT 与 DP 基线对齐 |
+| PD Decode | 20K | 1024 | CP=4 | (运行中) | (运行中) | — |
+
+**正确性验证**（max_tokens=1, temperature=0）:
+| 场景 | Input | CP Size | PD 输出 | Direct 输出 | 一致 |
+|------|-------|---------|---------|-------------|------|
+| PD | ~5K | CP=1 | " the" | " the" | ✓ |
+| PD | ~20K | CP=4 | " the" | " the" | ✓ |
+| PD | ~40K | CP=8 | " Rome" | " Rome" | ✓ |
+
 ### 2026-05-01 Session 5
 - 修复 CP=4/8 decode 性能回归（TPOT 80.61ms → ~7ms）
   - 根因：`coordinate_batch_across_dp` 对所有 DP rank 取 cudagraph_mode 最小值，非 CP rank（0 tokens）dispatch 为 NONE 导致所有 rank 降级为 eager 模式
