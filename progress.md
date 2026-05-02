@@ -648,6 +648,20 @@
 - 并发 PD decode 的 TTFT 受调度器互斥限制（dync_has_decode），这是 Local PD 的设计预期
 - 下一步：混合 CP size 测试、代码清理、移除 proxy 调试输出
 
+**PD Mixed CP Size Decode Benchmark（4 prompts, concurrency=1, request-rate=1, output=1024）**:
+| 场景 | Input Mix | TTFT P50 | TPOT P50 | 备注 |
+|------|-----------|-----------|-----------|------|
+| Mixed | 4K(CP=1) + 20K(CP=4) + 40K(CP=8) | 486ms | 9.58ms | TPOT 与基线对齐，无回归 |
+
+**与 CrossDPExampleConnector 基线对比**:
+| 场景 | CrossDP TPOT P50 | PD TPOT P50 | 差异 |
+|------|-------------------|-------------|------|
+| CP=1 (4K) | 8.16ms | 9.20ms | +1.04ms |
+| CP=4 (20K) | 9.51ms | 9.82ms | +0.31ms |
+| CP=8 (40K) | 9.51ms | 10.24ms | +0.73ms |
+
+PD decode 的 TPOT 与 CrossDPExampleConnector 基线接近，额外开销来自 KV IPC transfer（~1ms）。
+
 ### 2026-05-01 Session 5
 - 修复 CP=4/8 decode 性能回归（TPOT 80.61ms → ~7ms）
   - 根因：`coordinate_batch_across_dp` 对所有 DP rank 取 cudagraph_mode 最小值，非 CP rank（0 tokens）dispatch 为 NONE 导致所有 rank 降级为 eager 模式
