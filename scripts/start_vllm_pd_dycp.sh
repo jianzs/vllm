@@ -15,7 +15,8 @@ export VLLM_VERSION=0.13.0
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=380
 export VLLM_ATTENTION_BACKEND=FLASHMLA
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-export VLLM_USE_FORCE_LOAD_BALANCE=1
+# VLLM_USE_FORCE_LOAD_BALANCE=1 causes model output degradation on L20Y GPUs
+# export VLLM_USE_FORCE_LOAD_BALANCE=1
 
 # KV cache storage for LocalPDConnector
 KV_STORAGE_PATH=${KV_STORAGE_PATH:-/tmp/local_pd_kv}
@@ -55,7 +56,7 @@ case "${1:-server}" in
         --distributed-executor-backend dmp \
         --max-model-len 1048576 \
         --max-num-batched-tokens 4096 \
-        --gpu-memory-utilization 0.80 \
+        --gpu-memory-utilization 0.70 \
         --no-enable-prefix-caching \
         --data-parallel-size ${DP_SIZE} \
         --tensor-parallel-size 1 \

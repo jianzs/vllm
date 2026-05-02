@@ -173,6 +173,9 @@
 - ~~解决 MoE all-to-all 同步瓶颈~~ — 已修复（纯同一 CP size 场景），混合 CP size 场景为设计预期
 - ~~运行 Prefill benchmark（不带 --kv-transfer-config，output=1）~~ — 已完成（Session 9）
 - 混合 CP size 负载的 TPOT 回归问题：需要真实 PD 部署验证（CrossDPExampleConnector 的 KV loading 走完整前向传播，不是真实场景）
+- **模型输出异常**：`VLLM_USE_FORCE_LOAD_BALANCE=1` 导致模型输出重复 token（点号、感叹号等），与 DyCP 代码无关
+  - 解决方案：移除 `VLLM_USE_FORCE_LOAD_BALANCE=1` 环境变量
+  - 已更新 `start_vllm_pd_dycp.sh`，移除该变量并将 `gpu-memory-utilization` 从 0.80 改为 0.70
 
 ### 2026-05-01 Session 7
 - 实现独立 CUDA graph 模式修复：DyCP 模式下各 CP 子组使用本地 `cudagraph_mode_for_dp` 而非全局 `synced_cudagraph_mode`，避免 prefill 子组降级 decode 子组的 CUDA graph 模式
@@ -486,6 +489,32 @@
     - 文件：`cross_dp_scheduler.py`
 
 - 下一步：同步到远程机器，运行 PD 分离端到端测试
+
+### 2026-05-02 Session 12
+- 恢复上下文，评估当前状态：P0-P2 实现完成，20+ bug 已修复，PD 分离端到端测试待验证
+- 修复 `dycp_lse_out_ar` 形状不匹配 bug（#30）：
+  - 问题：FlashMLA 的 `_forward_decode` 返回 `softmax_lse` 形状为 `[B, H, S]`（3D），但 `dycp_lse_out_ar` 假设 `[B, H]`（2D）
+  - 当 S>1（CUDA graph 捕获时），`lse_exp.unsqueeze(-1)` 将 `[B, H, S]` 变为 `[B, H, S, 1]`，与 `[B, H, D]` 广播为 `[B, H, S, D]`，导致 crash
+  - 修复 1：`dycp_lse_out_ar` 中 squeeze 3D lse 到 2D（当 S=1 时）
+  - 修复 2：`dycp_lse_out_ar` 中 `cp_group.world_size == 1` 时直接返回（CP=1 无需 all-reduce）
+  - 修复 3：MLA decode 路径中 `actual_cp_size > 1` 时才调用 `dycp_lse_out_ar`（CP=1 请求不参与 CP 通信，无需 LSE 修正）
+  - 提交：`f9c1001fd`
+- 服务器启动成功（DyCP + LocalPDConnector），但发现模型输出异常：
+  - 所有配置（带/不带 DyCP、带/不带 FlashMLA、eager/graph 模式）下模型输出重复 token（点号、换行等）
+  - 问题与 DyCP 代码无关，可能是模型权重或 vLLM 框架回归
+  - 需要进一步调查模型输出问题的根因
+
+#### 待调查：模型输出异常
+- **已解决**：`VLLM_USE_FORCE_LOAD_BALANCE=1` 导致模型输出重复 token（点号、感叹号等）
+- 与 DyCP 代码无关，是 vLLM 框架或环境问题
+- 解决方案：不设置 `VLLM_USE_FORCE_LOAD_BALANCE=1` 环境变量
+- 注意：`start_vllm_pd_dycp.sh` 脚本中设置了此变量，需要移除
+
+#### PD 分离端到端测试结果
+- 短请求（CP=1，直接转发）：✓ 正常工作，输出正确
+- 长请求（CP>1，PD 流程）：✗ 走了 PD 流程（request ID 含 decode-pd），但输出为空
+- 问题：decode 阶段没有正确使用 prefill 的 KV cache，与 Session 10 发现的问题一致
+- 需要进一步调试 `_start_load_kv_ipc` 方法，检查 KV 数据是否正确加载到 decode 请求的 paged cache
 
 ### 2026-05-01 Session 5
 - 修复 CP=4/8 decode 性能回归（TPOT 80.61ms → ~7ms）
