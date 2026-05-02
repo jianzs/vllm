@@ -1407,12 +1407,15 @@ class GPUModelRunner(
         assert num_reqs > 0
         logger.debug(
             "prepare_inputs start "
-            "num_reqs=%d total_tokens=%d num_dycp_reqs=%d pcp_world=%d dycp_world=%d",
+            "num_reqs=%d total_tokens=%d num_dycp_reqs=%d pcp_world=%d dycp_world=%d "
+            "actual_cp_size=%d per_req_cp_sizes=%s",
             int(num_reqs),
             int(total_num_scheduled_tokens),
             int(num_dycp_reqs),
             int(self.pcp_world_size),
             int(self.dycp_world_size),
+            int(scheduler_output.actual_cp_size),
+            scheduler_output.per_req_cp_sizes,
         )
 
         # OPTIMIZATION: Start copying the block table first.

@@ -512,9 +512,31 @@
 
 #### PD 分离端到端测试结果
 - 短请求（CP=1，直接转发）：✓ 正常工作，输出正确
-- 长请求（CP>1，PD 流程）：✗ 走了 PD 流程（request ID 含 decode-pd），但输出为空
+- 长请求（CP>1，PD 流程）：✗ 走了 PD 流程（request ID 含 decode-pd），但输出为空/乱码
 - 问题：decode 阶段没有正确使用 prefill 的 KV cache，与 Session 10 发现的问题一致
 - 需要进一步调试 `_start_load_kv_ipc` 方法，检查 KV 数据是否正确加载到 decode 请求的 paged cache
+
+### 2026-05-02 Session 13
+- 恢复上下文，继续调试 CP>1 PD 输出正确性问题
+- 修复 2 个已确认的 bug（上一 session 修复但未 commit）：
+  1. **Decode 请求 cp_size 错误**：`do_remote_prefill` 请求应使用 cp_size=1，但 DyCP 阈值逻辑给 20K token 请求分配了 cp_size=4
+     - 修复：在 `cross_dp_scheduler.py` 中，`do_remote_prefill` 请求强制 `req_cp_size=1`
+  2. **CP=1 PD 请求 IPC 路径被跳过**：`start_load_kv` 中条件 `cp_world_size > 1` 导致 CP=1 PD 请求走 legacy 路径（`_gpu_kv_buffer` 为空）
+     - 修复：改为 `ipc_meta is not None`，所有 PD 请求在 IPC 初始化后走 IPC 路径
+- 深入分析 CP>1 PD 输出乱码的根因，逐行审查 IPC load 逻辑：
+  - IPC load 的 interleave mapping 公式与 `block_table.py` 中 `compute_domain_slot_mapping` 一致
+  - Block-level copy 逻辑正确：每个 source block 映射到唯一 destination block
+  - `per_rank_block_ids` 通过 `CrossDPKVCacheManager.get_block_ids()` 获取，包含所有 CP rank 的 block IDs
+  - `prefill_cp_ranks` 正确传递，IPC load 使用正确的 rank 映射
+  - `wait_for_layer_load` 使用 `cudaStreamWaitEvent` 确保 IPC copy 完成后再执行 attention
+  - `actual_cp_size` 在 decode-only batch 中应为 1（所有 decode 请求 cp_size=1）
+  - `num_dycp_reqs` 在 decode-only batch 中应为 0，block table 使用非 interleave 布局
+- 添加诊断日志以缩小问题范围：
+  - `_start_load_kv_ipc`：验证 per-rank block 数量、dst_slot_mapping 覆盖范围、cp_world_size、prefill_cp_ranks
+  - `build_connector_meta`：记录 decode 请求的 num_computed_tokens、block 数量
+  - `gpu_model_runner.py`：记录 actual_cp_size、per_req_cp_sizes
+- 远程机器不可用，无法运行测试验证
+- 下一步：远程可用后运行 CP>1 PD 测试，分析诊断日志定位根因
 
 ### 2026-05-01 Session 5
 - 修复 CP=4/8 decode 性能回归（TPOT 80.61ms → ~7ms）

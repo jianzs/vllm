@@ -851,6 +851,11 @@ class CrossDPScheduler(Scheduler):
                     req_cp_size = get_cp_size_for_request(
                         num_prompt_tokens, self.dycp_sorted_thresholds
                     )
+                    # PD decode requests always run on a single rank (CP=1).
+                    # KV is loaded via IPC from prefill ranks; no CP
+                    # communication is needed during decode.
+                    if kv_params and kv_params.get("do_remote_prefill"):
+                        req_cp_size = 1
                     # When decode is already running, defer new prefill
                     # requests to avoid MoE all-to-all sync bottleneck
                     # across mixed-phase DP ranks.
