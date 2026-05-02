@@ -1,6 +1,37 @@
 # DyCP Progress
 
-## 当前状态：P2 实现阶段（完成）→ 测试与修复阶段
+## 当前状态：测试与修复阶段 → 代码审查与优化阶段
+
+### 2026-05-03 Session 17
+
+- 代码审查：系统性审查 DyCP 核心代码（scheduler、KV cache、IPC、block table、PCPManager）
+- 修复 5 个 bug 并提交（commit `ed014b742`）：
+  1. **`dycp_has_decode` 延迟 PD decode 请求**：PD decode 通过 IPC 内存拷贝加载 KV，不是完整的 prefill 前向传播，不会导致 MoE all-to-all 同步瓶颈。添加 `do_remote_prefill` 排除条件
+  2. **Preemption 崩溃 CP>1 请求**：原来先修改状态再检查 cp_ranks > 1 并抛出 RuntimeError，导致状态不一致。现在先检查再修改，CP>1 请求跳过 preemption
+  3. **Block table 尺寸不足**：当 `dycp_all_cp_sizes` 不包含 cp_size=1 时，`min_cp_size` 计算错误导致 block table 行数不足。添加 `min(min_cp_size, 1)` 确保 cp_size=1 场景被考虑
+  4. **`_ipc_delayed_prefill_ids` 内存泄漏**：PD decode 完成时未清理 tracking 字典。添加 `pop(prefix, None)` 清理
+  5. **CUDA event 泄漏**：每次 IPC load 创建的 CUDA event 从未销毁。添加 `cudaEventDestroy` 调用
+- 代码清理并提交（commit `84260162b`）：
+  - 修复 f-string `logger.debug` 为 lazy 格式化
+  - 修复拼写错误 "temparily" → "temporarily"
+  - 翻译中文注释为英文
+  - 清理 proxy 调试输出
+
+#### 代码审查发现的其他问题（未修复，记录备查）
+
+- `get_total_num_req` 公式在 DyCP 子组下不正确（但当前未被调用，是死代码）
+- Preemption 路径的 `running_long_count` 双重递减问题（preempted-then-cancelled 场景，有 TODO 标记）
+- `dycp_has_cp_prefill` 延迟对非重叠 rank 上的 PD decode 过于保守（性能优化，非正确性问题）
+- CP>1 decode 持续占用所有 rank，导致 `dycp_has_decode` 长期生效（设计预期，非 bug）
+- `_start_load_kv_ipc` 中 `prefill_cp_ranks` 缺失时的 fallback rank 映射在 PD 分离架构下不正确（当前 flow 确保 `prefill_cp_ranks` 总是存在）
+
+#### 远程验证结果
+
+- CP=1 PD（~7K tokens）：✓ 输出正确（"Paris"）
+- CP=4 PD（~20K tokens）：✓ 输出与 Direct 一致
+- CP=8 PD（~40K tokens）：✓ 输出与 Direct 一致
+- PD decode 调度：✓ `dycp_has_decode` 修复后 PD decode 请求不被延迟（0.15-0.21s 响应）
+- CUDA event 清理：✓ 日志确认 "IPC done, freeing prefill blocks" 正常工作
 
 ### 已完成 (P0) ✓
 
