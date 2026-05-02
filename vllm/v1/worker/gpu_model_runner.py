@@ -5018,7 +5018,7 @@ class GPUModelRunner(
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     def get_dycp_allgather_reserve_bytes(self) -> int:
-        """DyCP allgather 临时 KV tensor 所需额外显存（单层峰值）。
+        """Reserve bytes for DyCP allgather temporary KV tensors (per-layer peak).
 
         pcp_kv_allgather_and_restore creates temporary tensors at
         pre-division size. Profile run only covers max_num_tokens worth

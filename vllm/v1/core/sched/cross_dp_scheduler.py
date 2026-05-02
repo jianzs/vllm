@@ -358,10 +358,8 @@ class CrossDPScheduler(Scheduler):
         model_runner_outputs: list[ModelRunnerOutput],
     ) -> dict[int, EngineCoreOutputs]:
 
-        """
-        Due to we use example connector now, many stats are None. 
-        So, the scheduler_stats only contain the last dp stats.
-        """
+        """When using example connector, many stats are None, so
+        scheduler_stats only contains the last DP stats."""
         processed_request: list[str] = []
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         
@@ -703,7 +701,7 @@ class CrossDPScheduler(Scheduler):
             )
 
             """
-            TODO(AoChen): Long prefill token threshold is not implemented yet. We temparily ignore this for decode instance.
+            TODO(AoChen): Long prefill token threshold is not implemented yet. We temporarily ignore this for decode instance.
             """
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
@@ -745,7 +743,8 @@ class CrossDPScheduler(Scheduler):
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
                     )
-                    logger.debug(f"new_blocks: {new_blocks}, request.cp_ranks: {request.cp_ranks}, num_new_tokens: {num_new_tokens}")
+                    logger.debug("new_blocks: %s, request.cp_ranks: %s, num_new_tokens: %s",
+                                 new_blocks, request.cp_ranks, num_new_tokens)
                     if new_blocks is not None:
                         # The request can be scheduled.
                         break
@@ -1041,7 +1040,8 @@ class CrossDPScheduler(Scheduler):
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
                 )
-                logger.debug(f"new_blocks -- 2: {new_blocks}, request.cp_ranks: {request.cp_ranks}, num_new_tokens: {num_new_tokens}")
+                logger.debug("new_blocks: %s, request.cp_ranks: %s, num_new_tokens: %s",
+                             new_blocks, request.cp_ranks, num_new_tokens)
                 if new_blocks is None:
                     # The request cannot be scheduled.
                     break
@@ -1059,7 +1059,7 @@ class CrossDPScheduler(Scheduler):
                 if self.connector is not None:
                     """
                         In the example connector, new_computed_blocks + new_blocks is not used,
-                        So, temparily ignore it.
+                        so temporarily ignore it.
                     """
                     self.connector.update_state_after_alloc(
                         request=request,
