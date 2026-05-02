@@ -418,9 +418,11 @@ class MultiGroupBlockTable:
             try:
                 vllm_config = get_current_vllm_config()
                 dycp_cp_sizes = vllm_config.parallel_config.dycp_all_cp_sizes
-                # Use the minimum cp_size (including 1) for block table sizing.
-                # cp_size=1 means no CP, requiring the most blocks per request.
+                # Always include cp_size=1 as a possibility: requests below
+                # all thresholds default to cp_size=1, requiring the most
+                # blocks per request.
                 min_cp_size = min(dycp_cp_sizes) if dycp_cp_sizes else 1
+                min_cp_size = min(min_cp_size, 1)
                 effective_cp_world_size = (
                     dcp_world_size * pcp_world_size * min_cp_size
                 )

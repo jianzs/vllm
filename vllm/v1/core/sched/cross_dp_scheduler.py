@@ -758,6 +758,11 @@ class CrossDPScheduler(Scheduler):
                         raise NotImplementedError
                     else:
                         preempted_req = self.running.pop()
+                        if len(preempted_req.cp_ranks) > 1:
+                            # Cannot preempt CP>1 requests; put back and
+                            # skip to avoid inconsistent state.
+                            self.running.append(preempted_req)
+                            break
                         """
                         TODO(AoChen): Preempted request is also need to be removed from the request manager.
                         """
@@ -771,10 +776,7 @@ class CrossDPScheduler(Scheduler):
                         self.waiting.has_slot_for_long_request = self.request_manager.has_slot_for_long_request()
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
-                    
-                    if len(preempted_req.cp_ranks) > 1:
-                        raise RuntimeError("Preempted request has multiple CP ranks is not supported now.")
-                    
+
                     for rank in preempted_req.cp_ranks:
                         preempted_reqs[rank].append(preempted_req)
 
@@ -869,7 +871,12 @@ class CrossDPScheduler(Scheduler):
                     # When decode is already running, defer new prefill
                     # requests to avoid MoE all-to-all sync bottleneck
                     # across mixed-phase DP ranks.
-                    if dycp_has_decode and num_prompt_tokens > 0:
+                    # PD decode requests (do_remote_prefill) load KV via IPC
+                    # memory copy, not a full prefill forward pass, so they
+                    # don't cause MoE sync issues and should not be deferred.
+                    if (dycp_has_decode and num_prompt_tokens > 0
+                            and not (kv_params
+                                     and kv_params.get("do_remote_prefill"))):
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
                         continue

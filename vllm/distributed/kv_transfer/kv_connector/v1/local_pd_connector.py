@@ -811,10 +811,13 @@ class LocalPDConnector(KVConnectorBase_V1):
             return delay_free, return_params
 
         if kv_params.get("do_remote_prefill"):
-            # Decode finished: clean up in-memory metadata
+            # Decode finished: clean up in-memory metadata.
+            # Also clean up the delayed prefill tracking entry since
+            # the IPC copy is guaranteed complete at this point.
             prefix = kv_params.get("pd_request_prefix", "")
             self._completed_prefills.pop(prefix, None)
             self._prefill_requests.pop(request.request_id, None)
+            self._ipc_delayed_prefill_ids.pop(prefix, None)
             return False, None
 
         return False, None
@@ -1291,7 +1294,14 @@ class LocalPDConnector(KVConnectorBase_V1):
                     if prefill_req_id:
                         finished_sending.add(prefill_req_id)
             for did in completed:
-                del self._ipc_pending_events[did]
+                event_ptr, _ = self._ipc_pending_events.pop(did)
+                # Destroy CUDA event to prevent resource leak.
+                try:
+                    self._cuda_lib.CUDART_CHECK(
+                        self._cuda_lib.funcs["cudaEventDestroy"](event_ptr)
+                    )
+                except Exception:
+                    pass
             # Reset gpu sync flag for next batch
             if completed:
                 self._ipc_gpu_synced = False
