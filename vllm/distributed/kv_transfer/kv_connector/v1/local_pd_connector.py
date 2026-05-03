@@ -695,7 +695,7 @@ class LocalPDConnector(KVConnectorBase_V1):
 
         store_count = sum(1 for r in meta.requests if r.is_store)
         load_count = sum(1 for r in meta.requests if not r.is_store)
-        logger.info(
+        logger.debug(
             "build_connector_meta cp_rank=%d: %d store, %d load requests",
             cp_rank, store_count, load_count,
         )
@@ -709,7 +709,7 @@ class LocalPDConnector(KVConnectorBase_V1):
             self._cross_requests_need_load[cp_rank].pop(req_id, None)
         remaining = len(self._cross_requests_need_load[cp_rank])
         if remaining > 0:
-            logger.info(
+            logger.debug(
                 "build_connector_meta cp_rank=%d: %d load requests remain "
                 "for next step: %s",
                 cp_rank, remaining,
