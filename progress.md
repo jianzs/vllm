@@ -28,6 +28,24 @@
   - 确认功能正常：在 orphan 清理路径中用于查找 prefill request ID 以释放 blocks
   - 与 `_completed_prefills["prefill_req_id"]` 冗余，但移除风险大于收益，保持现状
 
+- **代码审查发现并修复 3 个调度器 bug**（cross_dp_scheduler.py）：
+
+  1. **抢占请求 stale cp_ranks 导致调度阻塞**（HIGH）：
+     - 问题：CP=1 请求被抢占后，`cp_ranks` 保留旧值。重新调度时 `select_dp` 检查旧 rank 是否可用，如果被占用则返回 `None`，导致调度器 `break` 退出等待循环，阻止后续所有请求调度
+     - 修复（2 处）：
+       a. `select_dp`：当 `cp_ranks` 旧 rank 不可用且 DyCP 启用时，清除 `cp_ranks` 并回退到 DyCP 感知的 rank 选择路径，而非返回 `None`
+       b. 抢占路径：抢占后立即清除 `preempted_req.cp_ranks = []`，确保重新调度时走正常 rank 选择
+
+  2. **`select_dp` 和 `has_slot_for_cp_request` 数组越界风险**（MEDIUM）：
+     - 问题：当 `cp_size` 不整除 `cp_world_size` 时，`range(start, start + cp_size)` 可能超出 `num_req_per_dp` 数组边界
+     - 修复：循环上界从 `self.cp_world_size` 改为 `self.cp_world_size - cp_size + 1`
+     - 注：DyCP 配置校验确保 `cp_size` 是 `dp_per_domain` 的因子，实际不会触发，但添加防御性检查
+
+  3. **容量公式在 DyCP 下过于保守**（LOW，未修复）：
+     - 问题：`len(self.running) == (max_num_running_reqs - running_long_count) * cp_world_size + running_long_count` 假设每个长请求占用所有 rank，DyCP 下长请求只占用 `cp_size` 个 rank
+     - 影响：调度器可能过早拒绝新请求（保守行为，不会导致正确性问题）
+     - 计划：使用 `request_manager.get_total_num_req()` 替代公式
+
 - **高并发 PD 性能测试**（DeepSeek-V2-Lite, 8×GPU, dp_per_domain=8, FLASHMLA, LocalPDConnector + Proxy）：
 
   **CP=1 PD Decode Benchmark（output=128）**:

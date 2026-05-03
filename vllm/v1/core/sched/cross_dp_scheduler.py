@@ -82,6 +82,12 @@ class RequestManager:
         if len(request.cp_ranks) > 0:
             if all([self.num_req_per_dp[rank] < self.max_num_seqs for rank in request.cp_ranks]):
                 return request.cp_ranks
+            # Stale cp_ranks from a preempted request: the old ranks
+            # are occupied. Fall through to DyCP-aware rank selection
+            # instead of returning None, which would block all
+            # subsequent scheduling.
+            if cp_size > 0:
+                request.cp_ranks = []
             else:
                 return None
 
@@ -90,7 +96,7 @@ class RequestManager:
             # Ranks must start at multiples of cp_size.
             best_group = None
             best_min_reqs = float('inf')
-            for start in range(0, self.cp_world_size, cp_size):
+            for start in range(0, self.cp_world_size - cp_size + 1, cp_size):
                 group = list(range(start, start + cp_size))
                 if not all(self.num_req_per_dp[r] < self.max_num_seqs for r in group):
                     continue
@@ -184,7 +190,7 @@ class RequestManager:
             return any(self.num_req_per_dp[i] < self.max_num_seqs
                        for i in range(self.cp_world_size))
         # CP>1: any aligned subgroup of cp_size with room
-        for start in range(0, self.cp_world_size, cp_size):
+        for start in range(0, self.cp_world_size - cp_size + 1, cp_size):
             group = range(start, start + cp_size)
             if all(self.num_req_per_dp[r] < self.max_num_seqs for r in group):
                 return True
@@ -849,6 +855,10 @@ class CrossDPScheduler(Scheduler):
 
                     for rank in preempted_req.cp_ranks:
                         preempted_reqs[rank].append(preempted_req)
+                    # Clear cp_ranks so the re-scheduled request goes
+                    # through DyCP-aware rank selection instead of
+                    # trying stale ranks that may now be occupied.
+                    preempted_req.cp_ranks = []
 
                     # preempted_reqs.append(preempted_req)
                     if preempted_req == request:
