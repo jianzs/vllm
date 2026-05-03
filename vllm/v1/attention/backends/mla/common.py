@@ -2912,6 +2912,12 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                         if cp_size < self.dycp_world_size
                         else get_dycp_group()
                     )
+                    logger.debug(
+                        "DYCP_NCCL: prefill kv all_gather rank=%d "
+                        "cp_size=%d group_ws=%d num_dycp_reqs=%d",
+                        self.dycp_rank, cp_size,
+                        dycp_group.world_size,
+                        attn_metadata.num_dycp_reqs)
                     gathered = dycp_group.all_gather(
                         local_gathered_kvcache, dim=0)
                 else:
@@ -3285,6 +3291,14 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 if cp_size > 1 and cp_size < self.dycp_world_size
                 else get_dycp_group()
             )
+            logger.debug(
+                "DYCP_NCCL: prefill pcp_kv_allgather rank=%d "
+                "cp_size=%d group_ws=%d num_dycp_reqs=%d "
+                "actual_cp_size=%d",
+                self.dycp_rank, cp_size,
+                dycp_group.world_size,
+                attn_metadata.num_dycp_reqs,
+                attn_metadata.actual_cp_size)
             k_c_normed, k_pe = pcp_kv_allgather_and_restore(
                 k_c_normed,
                 k_pe,
@@ -3492,6 +3506,15 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                     if cp_size > 1 and cp_size < self.dycp_world_size
                     else get_dycp_group()
                 )
+                logger.debug(
+                    "DYCP_NCCL: decode lse all_reduce rank=%d "
+                    "cp_size=%d group_ws=%d decode_dycp_reqs=%d "
+                    "num_dycp_reqs=%d num_decodes=%d actual_cp_size=%d",
+                    self.dycp_rank, cp_size,
+                    dycp_group.world_size, decode_dycp_reqs,
+                    attn_metadata.num_dycp_reqs,
+                    attn_metadata.num_decodes,
+                    attn_metadata.actual_cp_size)
                 attn_out = dycp_lse_out_ar(
                     attn_out,
                     lse,

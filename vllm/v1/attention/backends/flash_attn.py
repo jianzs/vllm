@@ -772,7 +772,9 @@ class FlashAttentionImpl(AttentionImpl):
                     return_softmax_lse=True,
                 )
 
-                if self.dycp_world_size > 1:
+                decode_dycp_reqs = min(attn_metadata.num_dycp_reqs,
+                                       attn_metadata.num_decodes)
+                if decode_dycp_reqs > 0 and attn_metadata.actual_cp_size > 1:
                     cp_size = attn_metadata.actual_cp_size
                     dycp_group = (
                         get_dycp_subgroup(cp_size)
@@ -783,7 +785,7 @@ class FlashAttentionImpl(AttentionImpl):
                         output,
                         temp_lse.transpose(0, 1),
                         dycp_group,
-                        attn_metadata.num_dycp_reqs,
+                        decode_dycp_reqs,
                     )
                     return output
                 return output

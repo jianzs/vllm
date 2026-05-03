@@ -3682,6 +3682,13 @@ class GPUModelRunner(
                     dycp_hidden_states = hidden_states[:num_dycp_tokens_unpadded]
                     non_dycp_hidden_states = hidden_states[num_dycp_tokens_unpadded:]
 
+                    logger.debug(
+                        "DYCP_NCCL: post-forward restore_hidden_states "
+                        "rank=%d cp_request=%d actual_cp_size=%d "
+                        "dycp_tokens=%d",
+                        self.dycp_rank, num_cp_request,
+                        scheduler_output.actual_cp_size,
+                        num_dycp_tokens_unpadded)
                     dycp_hidden_states = self.pcp_manager.get_dycp_restore_hidden_states(
                         dycp_hidden_states, num_dycp_tokens_unpadded,
                         actual_cp_size=scheduler_output.actual_cp_size,

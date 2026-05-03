@@ -1377,7 +1377,9 @@ class FlashInferImpl(AttentionImpl):
                         is_lse_base_on_e=False,
                     )
 
-                elif self.dycp_world_size > 1 and attn_metadata.num_dycp_reqs > 0:
+                elif (self.dycp_world_size > 1
+                      and attn_metadata.num_dycp_reqs > 0
+                      and attn_metadata.actual_cp_size > 1):
                     lse = torch.empty(
                         (decode_query.size(0), decode_query.size(1)),
                         dtype=torch.float32,

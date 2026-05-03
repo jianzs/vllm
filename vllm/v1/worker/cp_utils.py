@@ -409,6 +409,11 @@ class PCPManager:
             and actual_cp_size < self.dycp_world_size
             else get_dycp_group()
         )
+        logger.debug(
+            "DYCP_NCCL: restore_slot_mapping all_gather rank=%d "
+            "cp_size=%d group_ws=%d tokens=%d",
+            self.dycp_rank, actual_cp_size,
+            dycp_group.world_size, num_tokens_unpadded)
         slot_mapping = dycp_group.all_gather(
             slot_mapping[:num_tokens_unpadded],
             0,
@@ -456,6 +461,11 @@ class PCPManager:
             and actual_cp_size < self.dycp_world_size
             else get_dycp_group()
         )
+        logger.debug(
+            "DYCP_NCCL: restore_hidden_states all_gather rank=%d "
+            "cp_size=%d group_ws=%d tokens=%d",
+            self.dycp_rank, actual_cp_size,
+            dycp_group.world_size, num_tokens_unpadded)
         hidden_states = dycp_group.all_gather(
             hidden_states[:num_tokens_unpadded],
             0,

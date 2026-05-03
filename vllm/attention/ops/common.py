@@ -283,6 +283,13 @@ def dycp_lse_out_ar(
     """
     if cp_attn_lse is None or cp_group.world_size == 1:
         return cp_attn_out
+    import logging
+    logger = logging.getLogger("vllm.attention.ops.common")
+    logger.debug(
+        "DYCP_NCCL: dycp_lse_out_ar all_reduce group_ws=%d "
+        "num_dycp_reqs=%d lse_shape=%s",
+        cp_group.world_size, num_dycp_reqs,
+        list(cp_attn_lse.shape))
     # FlashMLA returns lse as [B, H, S]; squeeze to [B, H] for decode (S=1)
     if cp_attn_lse.ndim == 3 and cp_attn_lse.shape[-1] == 1:
         cp_attn_lse = cp_attn_lse.squeeze(-1)
