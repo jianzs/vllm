@@ -936,6 +936,8 @@ class CrossDPScheduler(Scheduler):
 
                 is_long = self._is_long_request(request)
 
+                kv_params = request.kv_transfer_params
+
                 # DyCP: determine cp_size from thresholds
                 req_cp_size = 1
                 if self.dycp_enabled:
