@@ -45,6 +45,34 @@
     3. **某些未审计的 NCCL 操作路径**：可能存在未检查的 NCCL 集合操作，条件判断基于 per-rank 的 `actual_cp_size` 或 `num_dycp_reqs`。
     4. **DP coordination all_reduce 与 DyCP 子组操作的时序问题**：空闲 rank 的 `_dummy_run` 和活跃 rank 的 `execute_model` 可能在不同时间调用 NCCL 操作。
 
+  - **MoE all-to-all 深度审计**（commit `19ac4da7b` 附加诊断日志）：
+
+    审计了 MoE all-to-all 通信路径，确认空闲 rank 的 `_dummy_run` 正确参与 MoE all-to-all：
+    - `_dummy_run` 运行完整的模型前向传播（包括 MoE 层），确保 EP/DP 组的 all-to-all 操作被所有 rank 调用
+    - `coordinate_batch_across_dp` 在 `_dummy_run` 和 `execute_model` 中都被调用，确保 DP 同步
+    - EP 启用时 `allow_dp_padding` 强制为 True，确保所有 rank 的 token 数量一致
+    - Chunked 路径有 lockstep 机制（`local_size[i] = 1` 当 rank 无 token 时），防止 all2all 死锁
+
+    **关键结论**：MoE all-to-all 不是死锁原因。空闲 rank 通过 `_dummy_run` 正确参与所有 DP/EP 级 NCCL 操作。
+
+  - **NCCL 子组创建验证**：
+
+    审计 `parallel_state.py` 中 DyCP 子组创建逻辑，确认 `GroupCoordinator` 正确处理多子组：
+    - CP=4 时创建两个独立子组：`[0,1,2,3]` 和 `[4,5,6,7]`
+    - 每个 rank 通过 `if self.rank in ranks` 找到自己的子组
+    - `get_dycp_subgroup(4).all_gather()` 在不同 rank 上操作不同的 NCCL process group
+    - 子组内的 all_gather 只需要该子组的 4 个 rank 参与，与其他子组无关
+
+  - **空闲 rank 诊断日志**（commit `19ac4da7b`）：
+
+    在 `gpu_worker.py` 中添加空闲 rank 日志，记录 `dycp_rank`、`actual_cp_size`、`num_cp_request` 和 `none_tokens_in_peer_sched`，帮助诊断空闲 rank 的状态。
+
+  - **缩小死锁范围的关键测试计划**：
+
+    1. **CP=4-only 测试**（无 CP=1/8）：如果 CP=4-only 也死锁，问题在 NCCL 子组内部（4 rank 子组内的 all_gather）；如果 CP=4-only 稳定，问题在空闲 rank 与活跃 rank 的交互
+    2. **VLLM_LOG_LEVEL=DEBUG 远程测试**：捕获 DYCP_NCCL 日志，定位卡住的具体 NCCL 操作
+    3. **NCCL_DEBUG=TRACE**：获取 NCCL 通信层面的详细日志
+
   **下一步**：
   - 在远程机器上运行混合 CP 测试，启用 `VLLM_LOG_LEVEL=DEBUG` 捕获 DYCP_NCCL 日志
   - 测试仅 CP=4 请求（无 CP=1/8）以缩小问题范围
