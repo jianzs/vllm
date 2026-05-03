@@ -299,7 +299,6 @@ class LocalPDConnector(KVConnectorBase_V1):
             logger.info("IPC disabled via VLLM_DYCP_USE_IPC=0")
             return
 
-        import time as _time
         t0 = _time.monotonic()
 
         from vllm.distributed.device_communicators.cuda_wrapper import (
@@ -389,7 +388,7 @@ class LocalPDConnector(KVConnectorBase_V1):
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
         kv_params = request.kv_transfer_params
-        logger.info(
+        logger.debug(
             "get_num_new_matched_tokens called: req=%s, "
             "num_computed=%d, kv_params=%s",
             request.request_id,
@@ -457,10 +456,9 @@ class LocalPDConnector(KVConnectorBase_V1):
             if ext_tokens <= 0:
                 return 0, False
 
-            import time as _time
             _now = _time.monotonic() * 1000
             _gap = _now - meta.get("_finish_time_ms", _now)
-            logger.info(
+            logger.debug(
                 "External KV found for prefix=%s: %d tokens "
                 "(aligned=%d, gap_from_prefill=%.1fms)",
                 prefix, num_prompt_tokens, aligned, _gap,
@@ -474,13 +472,13 @@ class LocalPDConnector(KVConnectorBase_V1):
         if kv_params.get("do_remote_decode"):
             # Prefill request: track for KV saving, execute normally
             self._prefill_requests[request.request_id] = kv_params
-            logger.info(
+            logger.debug(
                 "Tracked prefill req=%s, _prefill_requests now has %d entries",
                 request.request_id, len(self._prefill_requests),
             )
             return 0, False
 
-        logger.info(
+        logger.debug(
             "Request %s has kv_transfer_params but no PD flags: %s",
             request.request_id, kv_params,
         )
@@ -492,7 +490,7 @@ class LocalPDConnector(KVConnectorBase_V1):
         blocks: "KVCacheBlocks",
         num_external_tokens: int,
     ):
-        logger.info(
+        logger.debug(
             "update_state_after_alloc: req=%s, num_ext=%d, "
             "cp_ranks=%s, kv_params=%s",
             request.request_id, num_external_tokens,
@@ -505,7 +503,7 @@ class LocalPDConnector(KVConnectorBase_V1):
                 self._cross_requests_need_load[cp_rank][
                     request.request_id
                 ] = request
-            logger.info(
+            logger.debug(
                 "Registered load for req=%s on cp_ranks=%s, "
                 "total loads per rank: %s",
                 request.request_id, request.cp_ranks,
@@ -707,7 +705,6 @@ class LocalPDConnector(KVConnectorBase_V1):
         # partner never arrived. Safe to remove because decode requests
         # carry their own metadata via kv_transfer_params fallback.
         if cp_rank == 0 and self._completed_prefills:
-            import time as _time
             now_ms = _time.monotonic() * 1000
             orphaned = [
                 k for k, v in self._completed_prefills.items()
@@ -789,13 +786,12 @@ class LocalPDConnector(KVConnectorBase_V1):
             }
 
             # Store in memory (no file I/O)
-            import time as _time
             self._completed_prefills[prefix] = meta
             meta["_finish_time_ms"] = _time.monotonic() * 1000
             # Clean up prefill tracking (all chunks done)
             self._prefill_requests.pop(request.request_id, None)
 
-            logger.info(
+            logger.debug(
                 "Prefill finished for prefix=%s "
                 "(num_prompt_tokens=%d, cp_world_size=%d, "
                 "per_rank_blocks=%s)",
@@ -827,7 +823,7 @@ class LocalPDConnector(KVConnectorBase_V1):
             if delay_free:
                 self._ipc_delayed_prefill_ids[prefix] = request.request_id
                 return_params["prefill_req_id"] = request.request_id
-                logger.info(
+                logger.debug(
                     "Delaying block free for prefix=%s req=%s",
                     prefix, request.request_id,
                 )
@@ -899,7 +895,6 @@ class LocalPDConnector(KVConnectorBase_V1):
         prefix: str,
     ) -> None:
         """Load KV via CUDA IPC from remote ranks' paged buffers."""
-        import time as _time
         t0 = _time.monotonic()
 
         # Get IPC metadata from connector metadata (passed from scheduler)
@@ -1139,7 +1134,7 @@ class LocalPDConnector(KVConnectorBase_V1):
         )
 
         elapsed = (_time.monotonic() - t0) * 1000
-        logger.info(
+        logger.debug(
             "IPC KV async launched for prefix=%s: %d layers, %d tokens "
             "from %d ranks (prefill_ranks=%s, decode_rank=%d) in %.1fms "
             "(decode=%s, prefill=%s)",
@@ -1155,8 +1150,7 @@ class LocalPDConnector(KVConnectorBase_V1):
         prefix: str,
     ) -> None:
         """Load KV from _gpu_kv_buffer (legacy all-gather path)."""
-        import time as _time
-
+        
         kv_buf = self._gpu_kv_buffer.get(prefix)
         if kv_buf is None:
             logger.error("No GPU KV buffer for prefix=%s", prefix)
@@ -1196,7 +1190,7 @@ class LocalPDConnector(KVConnectorBase_V1):
         del self._gpu_kv_buffer[prefix]
 
         _elapsed = (_time.monotonic() - _t0) * 1000
-        logger.info(
+        logger.debug(
             "KV injected (legacy) for prefix=%s: %d layers in %.1fms",
             prefix, layers_injected, _elapsed,
         )
@@ -1328,7 +1322,7 @@ class LocalPDConnector(KVConnectorBase_V1):
             # Reset gpu sync flag for next batch
             if completed:
                 self._ipc_gpu_synced = False
-                logger.info(
+                logger.debug(
                     "get_finished: IPC done, freeing prefill blocks %s",
                     finished_sending,
                 )

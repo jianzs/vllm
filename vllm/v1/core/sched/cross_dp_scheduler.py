@@ -1,5 +1,3 @@
-from ast import Set
-import itertools
 import os
 import time
 from collections import defaultdict
@@ -428,13 +426,14 @@ class CrossDPScheduler(Scheduler):
             )
             if kv_connector_stats and self.connector:
                 kv_stats = self.connector.get_kv_connector_stats()
-                assert kv_stats is None, "Where example connector kv_stats is None, if not, implemented it"
+                assert kv_stats is None, (
+                    "kv_stats must be None for the example connector; "
+                    "implement aggregation if needed")
                 if kv_stats:
                     kv_connector_stats = kv_connector_stats.aggregate(kv_stats)
 
             failed_kv_load_req_ids = None
             if kv_connector_output and kv_connector_output.invalid_block_ids:
-                assert False, "This is unreachable"
                 # These blocks contain externally computed tokens that failed to
                 # load. Identify affected requests and adjust their computed token
                 # count to trigger recomputation of the invalid blocks.
@@ -974,14 +973,6 @@ class CrossDPScheduler(Scheduler):
 
                 # Skip request if the structured output request is still waiting
                 # for FSM compilation.
-                # if request.status == RequestStatus.WAITING_FOR_FSM:
-                #     structured_output_req = request.structured_output_request
-                #     if structured_output_req and structured_output_req.grammar:
-                #         request.status = RequestStatus.WAITING
-                #     else:
-                #         self.waiting.pop_request()
-                #         skipped_waiting_requests.prepend_request(request)
-                #         continue
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
@@ -1022,10 +1013,6 @@ class CrossDPScheduler(Scheduler):
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
-
-                # encoder_inputs_to_schedule = None
-                # external_load_encoder_input = []
-                # new_encoder_compute_budget = encoder_compute_budget
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
@@ -1295,7 +1282,6 @@ class CrossDPScheduler(Scheduler):
                 scheduler_output.kv_connector_metadata = meta
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
-            # self._update_after_schedule(scheduler_output)
             for scheduler_output in total_scheduler_output:
                 if scheduler_output is None:
                     continue

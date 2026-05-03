@@ -1455,9 +1455,6 @@ class GPUModelRunner(
                 out=positions_np,
             )
 
-        # self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        # self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
-
         if self.pcp_world_size > 1:
             num_scheduled_tokens[:num_reqs], pcp_positions = (
                 self.pcp_manager.update_tokens_for_pcp(

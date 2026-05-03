@@ -336,87 +336,7 @@ async def _handle_pd_request(endpoint: str, request: Request):
     Orchestrates the prefill -> decode flow.
     """
     original_body = await request.json()
-    prefix = _make_request_prefix()
-    prefill_request_id = f"prefill-{prefix}"
-    decode_request_id = f"decode-{prefix}"
-
-    logger.info(
-        "New PD request [%s] endpoint=%s model=%s",
-        prefix, endpoint, original_body.get("model", "unknown"),
-    )
-
-    # --- Phase 1: Prefill ---
-    prefill_req = _build_prefill_request(original_body, prefix)
-
-    try:
-        session = await proxy_config.get_session()
-        prefill_resp = await _do_prefill(
-            session, endpoint, prefill_req, prefill_request_id,
-        )
-    except aiohttp.ClientResponseError as exc:
-        logger.error("Prefill request failed [%s]: %s", prefix, exc.message)
-        return JSONResponse(
-            status_code=exc.status,
-            content={
-                "error": {
-                    "message": f"Prefill failed: {exc.message}",
-                    "type": "proxy_error",
-                    "code": exc.status,
-                }
-            },
-        )
-    except aiohttp.ClientError as exc:
-        logger.error("Prefill connection error [%s]: %s", prefix, exc)
-        return JSONResponse(
-            status_code=502,
-            content={
-                "error": {
-                    "message": f"Prefill connection error: {exc}",
-                    "type": "proxy_error",
-                    "code": 502,
-                }
-            },
-        )
-
-    # Extract kv_transfer_params from prefill response
-    prefill_kv_params = prefill_resp.get("kv_transfer_params")
-    logger.info(
-        "Prefill completed [%s] kv_transfer_params=%s",
-        prefix, prefill_kv_params,
-    )
-
-    # --- Phase 2: Decode ---
-    decode_req = _build_decode_request(original_body, prefix, prefill_kv_params)
-    is_streaming = original_body.get("stream", False)
-
-    # Use same endpoint as original request for decode
-    decode_endpoint = endpoint
-
-    logger.info(
-        "Starting decode [%s] endpoint=%s streaming=%s",
-        prefix, decode_endpoint, is_streaming,
-    )
-
-    async def generate():
-        try:
-            session = await proxy_config.get_session()
-            async for chunk in _stream_decode(
-                session, decode_endpoint, decode_req, decode_request_id,
-            ):
-                yield chunk
-        except aiohttp.ClientError as exc:
-            logger.error("Decode connection error [%s]: %s", prefix, exc)
-            error_payload = json.dumps({
-                "error": {
-                    "message": f"Decode connection error: {exc}",
-                    "type": "proxy_error",
-                    "code": 502,
-                }
-            }).encode()
-            yield error_payload
-
-    media_type = "text/event-stream" if is_streaming else "application/json"
-    return StreamingResponse(generate(), media_type=media_type)
+    return await _handle_pd_request_with_body(endpoint, original_body)
 
 
 # ---------------------------------------------------------------------------
@@ -436,13 +356,13 @@ async def _dispatch_request(endpoint: str, request: Request):
 
     if estimated_tokens < threshold:
         request_id = f"direct-{uuid.uuid4().hex[:12]}"
-        logger.info(
+        logger.debug(
             "Short request [%s] endpoint=%s estimated_tokens=%d -> direct",
             request_id, endpoint, estimated_tokens,
         )
         return await _forward_direct(endpoint, body, request_id)
     else:
-        logger.info(
+        logger.debug(
             "Long request endpoint=%s estimated_tokens=%d -> PD two-phase",
             endpoint, estimated_tokens,
         )
@@ -459,7 +379,7 @@ async def _handle_pd_request_with_body(endpoint: str, original_body: dict):
     prefill_request_id = f"prefill-{prefix}"
     decode_request_id = f"decode-{prefix}"
 
-    logger.info(
+    logger.debug(
         "New PD request [%s] endpoint=%s model=%s",
         prefix, endpoint, original_body.get("model", "unknown"),
     )
@@ -499,7 +419,7 @@ async def _handle_pd_request_with_body(endpoint: str, original_body: dict):
 
     # Extract kv_transfer_params from prefill response
     prefill_kv_params = prefill_resp.get("kv_transfer_params")
-    logger.info(
+    logger.debug(
         "Prefill completed [%s] kv_transfer_params=%s",
         prefix, prefill_kv_params,
     )
@@ -513,7 +433,7 @@ async def _handle_pd_request_with_body(endpoint: str, original_body: dict):
     # Use same endpoint as original request for decode
     decode_endpoint = endpoint
 
-    logger.info(
+    logger.debug(
         "Starting decode [%s] endpoint=%s streaming=%s",
         prefix, decode_endpoint, is_streaming,
     )
