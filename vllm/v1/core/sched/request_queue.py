@@ -228,22 +228,41 @@ class LongShortRequestQueue(RequestQueue):
         self,
         long_request_threshold: int,
         max_long_requests: int,
+        dycp_sorted_thresholds: list[tuple[int, int]] | None = None,
     ) -> None:
         if long_request_threshold <= 0:
             raise ValueError("long_request_threshold must be positive")
         if max_long_requests < 0:
             raise ValueError("max_long_requests must be non-negative")
-        
+
         self._queue: deque[Request] = deque()
         self.long_request_threshold = long_request_threshold
         self.max_long_requests = max_long_requests
         self.running_long_count = 0
         self.has_slot_for_long_request = True
+        self.dycp_sorted_thresholds = dycp_sorted_thresholds
+        # Set by the scheduler after both queue and RequestManager are created.
+        self._request_manager = None
     
     def is_long_request(self, request: Request) -> bool:
         """Check if a request is a long request based on token threshold."""
         num_prefill_tokens = request.num_tokens - request.num_output_tokens
         return num_prefill_tokens >= self.long_request_threshold
+
+    def _has_slot_for_long_request(self, request: Request) -> bool:
+        """Check if there is room for a long request.
+
+        Under DyCP, checks only the aligned subgroup needed for the request's
+        CP size, rather than requiring ALL ranks to have room.
+        Without DyCP, falls back to the cached has_slot_for_long_request.
+        """
+        if (self.dycp_sorted_thresholds
+                and self._request_manager is not None):
+            num_prefill_tokens = request.num_tokens - request.num_output_tokens
+            cp_size = get_cp_size_for_request(
+                num_prefill_tokens, self.dycp_sorted_thresholds)
+            return self._request_manager.has_slot_for_cp_request(cp_size)
+        return self.has_slot_for_long_request
     
     def add_request(self, request: Request) -> None:
         """Add a request to the queue according to FCFS policy."""
@@ -267,7 +286,7 @@ class LongShortRequestQueue(RequestQueue):
             
             if self.is_long_request(request):
                 # Check if we can schedule more long requests
-                if self.running_long_count >= self.max_long_requests or not self.has_slot_for_long_request:
+                if self.running_long_count >= self.max_long_requests or not self._has_slot_for_long_request(request):
                     # Skip this long request, continue searching
                     continue
                 # Can schedule this long request
@@ -275,7 +294,7 @@ class LongShortRequestQueue(RequestQueue):
             else:
                 # Short request, can always schedule
                 return self._pop_at_index(idx)
-        
+
         # No schedulable request found (all are long requests and limit reached)
         raise IndexError("no schedulable request (all long requests blocked), and it is not reachable")
     
@@ -315,7 +334,7 @@ class LongShortRequestQueue(RequestQueue):
             
             if self.is_long_request(request):
                 # Check if we can schedule more long requests
-                if self.running_long_count >= self.max_long_requests or not self.has_slot_for_long_request:
+                if self.running_long_count >= self.max_long_requests or not self._has_slot_for_long_request(request):
                     # Skip this long request, continue searching
                     continue
                 # Can schedule this long request

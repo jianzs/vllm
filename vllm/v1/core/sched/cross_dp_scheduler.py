@@ -70,6 +70,9 @@ class RequestManager:
         self.max_num_seqs = max_num_seqs
         self.num_long_req_per_domain = 0
         self.num_req_per_dp = [0] * self.cp_world_size
+        # Track number of running requests per CP size for accurate
+        # total request count under DyCP.
+        self.num_req_per_cp_size: dict[int, int] = {}
 
     def select_dp(
         self,
@@ -128,12 +131,20 @@ class RequestManager:
         if len(request.cp_ranks) > 1:
             self.num_long_req_per_domain += 1
 
+        cp_size = len(request.cp_ranks)
+        self.num_req_per_cp_size[cp_size] = \
+            self.num_req_per_cp_size.get(cp_size, 0) + 1
+
         for rank in request.cp_ranks:
             self.num_req_per_dp[rank] += 1
-    
+
     def free_req(self, request: Request) -> None:
         if len(request.cp_ranks) > 1:
             self.num_long_req_per_domain -= 1
+
+        cp_size = len(request.cp_ranks)
+        self.num_req_per_cp_size[cp_size] = \
+            self.num_req_per_cp_size.get(cp_size, 0) - 1
 
         for rank in request.cp_ranks:
             self.num_req_per_dp[rank] -= 1
@@ -145,14 +156,35 @@ class RequestManager:
         return self.num_long_req_per_domain
 
     def get_total_num_req(self) -> int:
-        # NOTE: This formula assumes all long requests use all
-        # cp_world_size ranks. Under DyCP, long requests may use
-        # different CP sizes (2, 4, 8), so the deduplication factor
-        # varies per request. Currently unused — fix when needed.
-        return sum(self.num_req_per_dp) - self.num_long_req_per_domain * (self.cp_world_size - 1)
+        # Count unique requests by accounting for per-CP-size
+        # deduplication. Each request with cp_size=N is counted N times
+        # in num_req_per_dp (once per rank), so we subtract (N-1)
+        # per request.
+        total = sum(self.num_req_per_dp)
+        for cp_size, count in self.num_req_per_cp_size.items():
+            total -= count * (cp_size - 1)
+        return total
 
     def has_slot_for_long_request(self) -> bool:
         return all(self.num_req_per_dp[i] < self.max_num_seqs for i in range(self.cp_world_size))
+
+    def has_slot_for_cp_request(self, cp_size: int) -> bool:
+        """Check if any aligned subgroup of cp_size has room for a new request.
+
+        Unlike has_slot_for_long_request which checks ALL ranks, this method
+        checks only the ranks needed for the given CP size. Under DyCP, a CP=2
+        request only needs 2 consecutive ranks, not all 8.
+        """
+        if cp_size <= 1:
+            # CP=1: any single rank with room
+            return any(self.num_req_per_dp[i] < self.max_num_seqs
+                       for i in range(self.cp_world_size))
+        # CP>1: any aligned subgroup of cp_size with room
+        for start in range(0, self.cp_world_size, cp_size):
+            group = range(start, start + cp_size)
+            if all(self.num_req_per_dp[r] < self.max_num_seqs for r in group):
+                return True
+        return False
 
     def __repr__(self) -> str:
         return (f"RequestManager(cp_world_size={self.cp_world_size}"
@@ -230,11 +262,15 @@ class CrossDPScheduler(Scheduler):
         self.waiting = LongShortRequestQueue(
             long_request_threshold=_thresh,
             max_long_requests=self.max_cp_tokens,
+            dycp_sorted_thresholds=self.dycp_sorted_thresholds if self.dycp_enabled else None,
         )
         self.request_manager = RequestManager(
             cp_world_size=self.cp_world_size,
             max_num_seqs=self.max_num_running_reqs,
         )
+        # Allow the queue to check per-CP-size slot availability under DyCP.
+        if self.dycp_enabled:
+            self.waiting._request_manager = self.request_manager
         # Track which requests are currently registered in request_manager
         # and counted in running_long_count. Prevents double-decrement when
         # a preempted request is later cancelled via finish_requests().

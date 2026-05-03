@@ -1,6 +1,93 @@
 # DyCP Progress
 
-## 当前状态：性能验证与稳定性测试阶段
+## 当前状态：代码清理与优化阶段
+
+### 2026-05-03 Session 21
+
+- **修复 1：`has_slot_for_long_request` 阻塞较小 CP 子组**：
+  - 问题：`RequestManager.has_slot_for_long_request()` 检查所有 rank 是否有空间，但 DyCP 下 CP=2 只需 2 个连续 rank，CP=4 只需 4 个。当部分 rank 满时，新长请求被错误阻塞
+  - 修复：
+    1. 添加 `RequestManager.has_slot_for_cp_request(cp_size)` 方法，按 CP size 检查对齐子组空间
+    2. `LongShortRequestQueue` 添加 `dycp_sorted_thresholds` 和 `_request_manager` 参数
+    3. `pop_request`/`peek_request` 在 DyCP 模式下按请求的 cp_size 检查子组空间
+    4. 非 DyCP 模式保持原有行为（cached boolean）
+  - 文件：`cross_dp_scheduler.py`, `request_queue.py`
+
+- **修复 2：`get_total_num_req` 公式在 DyCP 下不正确**：
+  - 问题：公式 `sum(num_req_per_dp) - num_long_req_per_domain * (cp_world_size - 1)` 假设所有长请求使用全部 rank，DyCP 下不同 CP size 的请求使用不同数量的 rank
+  - 修复：
+    1. 添加 `num_req_per_cp_size: dict[int, int]` 追踪每个 CP size 的请求数
+    2. `add_req`/`free_req` 更新 `num_req_per_cp_size`
+    3. `get_total_num_req` 使用 per-CP-size 计数计算正确的去重总数
+  - 文件：`cross_dp_scheduler.py`
+
+- **代码审查问题评估**：
+  - `get_padded_slot_mapping` 过度分配：**不适用** — 该代码路径仅在 PCP>1 时触发，DyCP 下 PCP=1，不会执行
+  - NCCL 子组跨 rank 校验：**低优先级** — 所有 rank 共享相同 `ParallelConfig`，配置不一致在实际中不会发生
+
+- **远程冒烟测试**：CP=1/2/4 请求均成功处理，无崩溃
+
+#### 待完成
+
+- 高并发混合 CP size 性能测试（concurrency > 1）
+- Streaming TTFT 测量修复
+- 长时间稳定性测试
+
+### 2026-05-03 Session 20
+
+- **代码审查**：系统性审查 DyCP 核心代码，发现 20 个问题
+
+- **修复 1：block_table.py 死代码清理**（commit `9c9ffdf5b`）：
+  - `min(min_cp_size, 1)` 始终返回 1，第一行赋值是死代码
+  - 简化为 `min_cp_size = 1`，添加注释说明 cp_size=1 是最坏情况
+
+- **修复 2：preemption CP>1 警告日志**（commit `9c9ffdf5b`）：
+  - 当所有运行请求都是 CP>1 时，preemption 无法驱逐任何请求
+  - 添加 `logger.warning` 使该条件在日志中可见
+  - 这是设计限制而非 bug：CP>1 请求无法安全抢占（会导致状态不一致）
+
+- **修复 3：`_completed_prefills` 孤立条目清理**（commit `9c9ffdf5b`）：
+  - `_completed_prefills` 在 prefill 完成时写入，decode 完成时清理
+  - 如果 decode 请求永远不到达（客户端断开），条目会永久存在
+  - 添加超时清理：5 分钟内没有 decode 伙伴的条目自动清除
+  - 安全：decode 请求通过 `kv_transfer_params` fallback 重建元数据
+
+- **回滚 Fix：`any(rank_blocks)` 修改导致 IndexError**（commit `fa8fbdce2`）：
+  - 代码审查发现 `any(rank_blocks) is not None` 始终为 True，改为 `any(rank_blocks)`
+  - 但这导致 `blocks_by_rank` 列表缺少空 rank 条目，破坏了位置-rank 对应关系
+  - `CrossDPKVCacheManager.get_blocks` 用 `blocks_all[i] for i in request.cp_ranks` 索引
+  - 过滤空 rank 后索引越界 → IndexError crash
+  - 回滚并用 `if True` + 注释说明意图：列表必须包含所有 rank 以维持索引对应
+
+- **长时间稳定性测试**（进行中）：
+  - 800 请求混合 CP 负载（CP=1: 400, CP=2: 150, CP=4: 150, CP=8: 100）
+  - 通过 PD proxy，concurrency=1，request-rate=1
+  - 前 56 个请求全部成功，延迟正常
+
+  **800 请求快速测试结果**（max_tokens=50，10.8 分钟）：
+  - Total: 800, Success: 800, Fail: 0
+  - Latency P50=0.6s, P90=1.2s, P99=1.3s
+  - CP=1 (4K): ~0.6s, CP=2 (8K): ~0.9s, CP=4 (20K): ~1.0s, CP=8 (40K): ~1.3s
+
+  **200 请求完整输出测试**（max_tokens=1024，25.9 分钟）：
+  - Total: 200, Success: 200, Fail: 0
+  - Latency P50=9.2s, P90=10.9s, P99=11.0s
+  - 注意：TTFT 测量包含完整请求时间（streaming SSE 解析问题），实际 TTFT 远低于此
+  - 不同 CP size 均稳定工作：CP=1 (4K), CP=2 (8K), CP=4 (20K), CP=8 (40K)
+
+#### 待完成
+
+- 修复 streaming TTFT 测量问题，获取准确的 PD TTFT/TPOT 数据
+- 混合 CP size 在高并发下的性能测试（concurrency > 1，观察 PD 互斥调度影响）
+- 代码审查发现的中优先级问题（`has_slot_for_long_request`、运行请求数公式等）
+
+- **代码审查发现的其他问题（未修复，记录备查）**：
+  1. `has_slot_for_long_request` 检查所有 rank，阻塞更小的 CP 子组（Medium）
+  2. 运行请求数公式假设二分类 long/short，DyCP 下不精确（Medium）
+  3. CUDA event 泄漏：`get_finished()` 未调用时 IPC event 不销毁（Medium，低风险）
+  4. `get_padded_slot_mapping` 使用 `self.pcp_world_size` 分配 buffer，DyCP 下过度分配（Medium，正确但浪费内存）
+  5. `_dycp_needs_pcp` 假设 CP 请求在数组前端，排序变化会静默破坏（Low）
+  6. NCCL 子组创建无跨 rank 校验，配置不一致会导致死锁（Low）
 
 ### 2026-05-03 Session 19
 
