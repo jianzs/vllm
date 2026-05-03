@@ -943,7 +943,7 @@ class LocalPDConnector(KVConnectorBase_V1):
                 )
         expected_dst_blocks = cdiv(actual_tokens, block_size)
         dst_blocks_used = len(set(dst_slot_mapping.numpy() // block_size))
-        logger.info(
+        logger.debug(
             "IPC KV load params: prefix=%s, cp_world_size=%d, "
             "actual_tokens=%d, num_prompt_tokens=%d, "
             "dst_blocks_used=%d, expected_dst_blocks=%d, "
