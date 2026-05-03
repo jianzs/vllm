@@ -145,6 +145,10 @@ class RequestManager:
         return self.num_long_req_per_domain
 
     def get_total_num_req(self) -> int:
+        # NOTE: This formula assumes all long requests use all
+        # cp_world_size ranks. Under DyCP, long requests may use
+        # different CP sizes (2, 4, 8), so the deduplication factor
+        # varies per request. Currently unused — fix when needed.
         return sum(self.num_req_per_dp) - self.num_long_req_per_domain * (self.cp_world_size - 1)
 
     def has_slot_for_long_request(self) -> bool:
@@ -231,6 +235,10 @@ class CrossDPScheduler(Scheduler):
             cp_world_size=self.cp_world_size,
             max_num_seqs=self.max_num_running_reqs,
         )
+        # Track which requests are currently registered in request_manager
+        # and counted in running_long_count. Prevents double-decrement when
+        # a preempted request is later cancelled via finish_requests().
+        self._active_req_ids: set[str] = set()
 
     def _update_after_schedule(
         self,
@@ -269,23 +277,24 @@ class CrossDPScheduler(Scheduler):
     def _free_request(self, request: Request) -> dict[str, Any] | None:
         assert request.is_finished()
 
-        """
-        TODO(AoChen): If the req is removed from the running queue, 
-        1. the running_long_count should be decremented.
-        2. the request manager should be updated.
-        3. the has_slot_for_long_request should be updated.
-        """
-        # PD requests are classified as short (CP=1) at schedule time,
-        # so they must also be classified as short at free time to keep
-        # running_long_count consistent.
-        kv_params = request.kv_transfer_params
-        is_long = (self.waiting.is_long_request(request)
-                   and not (kv_params and kv_params.get("do_remote_prefill"))
-                   and not (kv_params and kv_params.get("do_remote_decode")
-                            and not self.dycp_enabled))
-        self.waiting.running_long_count -= 1 if is_long else 0
-        self.request_manager.free_req(request)
-        self.waiting.has_slot_for_long_request = self.request_manager.has_slot_for_long_request()
+        # Only decrement running_long_count and free from request_manager
+        # if the request is still registered as active. Preempted requests
+        # are already unregistered during preemption; calling this again
+        # from finish_requests() would cause double-decrement.
+        if request.request_id in self._active_req_ids:
+            self._active_req_ids.discard(request.request_id)
+            # PD requests are classified as short (CP=1) at schedule time,
+            # so they must also be classified as short at free time to keep
+            # running_long_count consistent.
+            kv_params = request.kv_transfer_params
+            is_long = (self.waiting.is_long_request(request)
+                       and not (kv_params and kv_params.get("do_remote_prefill"))
+                       and not (kv_params and kv_params.get("do_remote_decode")
+                                and not self.dycp_enabled))
+            self.waiting.running_long_count -= 1 if is_long else 0
+            self.request_manager.free_req(request)
+            self.waiting.has_slot_for_long_request = \
+                self.request_manager.has_slot_for_long_request()
 
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
@@ -763,9 +772,7 @@ class CrossDPScheduler(Scheduler):
                             # skip to avoid inconsistent state.
                             self.running.append(preempted_req)
                             break
-                        """
-                        TODO(AoChen): Preempted request is also need to be removed from the request manager.
-                        """
+                        self._active_req_ids.discard(preempted_req.request_id)
                         self.request_manager.free_req(preempted_req)
                         _kv_params = preempted_req.kv_transfer_params
                         _is_long = (self.waiting.is_long_request(preempted_req)
@@ -1088,6 +1095,7 @@ class CrossDPScheduler(Scheduler):
                 self._update_connector_prefix_cache_stats(request)
                 
                 self.running.append(request)
+                self._active_req_ids.add(request.request_id)
                 self.waiting.running_long_count += 1 if is_long else 0
                 self.request_manager.add_req(request)
                 self.waiting.has_slot_for_long_request = self.request_manager.has_slot_for_long_request()
