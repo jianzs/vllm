@@ -3049,6 +3049,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 else:
                     can_use_dycp_context = (
                         self.dycp_world_size > 1
+                        and attn_metadata.actual_cp_size > 1
                         and attn_metadata.prefill is not None
                         and attn_metadata.num_decodes == 0
                         and attn_metadata.num_dycp_reqs == attn_metadata.num_prefills
