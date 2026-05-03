@@ -1,6 +1,55 @@
 # DyCP Progress
 
-## 当前状态：混合 CP size 稳定性测试发现 Worker 级 NCCL 死锁
+## 当前状态：Worker 级 NCCL 死锁根因分析进行中
+
+### 2026-05-04 Session 30
+
+- **Worker 级 NCCL 死锁根因分析**（深入代码审计）：
+
+  系统性审计所有 DyCP NCCL 集合操作（all_gather, all_reduce），发现以下关键问题：
+
+  **已修复**（commit `ff8046107`）：
+
+  1. **flash_attn.py:775 — 缺少 `num_dycp_reqs > 0` 和 `actual_cp_size > 1` 守卫**（HIGH）：
+     - 问题：DyCP decode 路径仅检查 `dycp_world_size > 1`，没有检查 `num_dycp_reqs` 或 `actual_cp_size`。空闲 rank（`actual_cp_size=1`, `num_dycp_reqs=0`）进入 DyCP 路径后，调用 `dycp_lse_out_ar` 时使用 `get_dycp_group()`（8-rank 全组），而活跃 rank 使用 `get_dycp_subgroup(4)`（4-rank 子组）。不同的 NCCL 组导致死锁。
+     - 修复：添加 `decode_dycp_reqs > 0 and actual_cp_size > 1` 守卫，与 MLA 后端一致。
+     - **注意**：DeepSeek-V2-Lite 使用 FLASHMLA 后端，此修复对当前模型无直接影响，但修正了 flash_attn 后端的正确性 bug。
+
+  2. **flashinfer.py:1380 — 缺少 `actual_cp_size > 1` 守卫**（HIGH）：
+     - 问题：DyCP decode 路径检查 `num_dycp_reqs > 0` 但不检查 `actual_cp_size > 1`。当 decode 请求原来是 CP>1 但当前 `actual_cp_size=1` 时，调用 `dycp_lse_out_ar` 使用 `get_dycp_group()`（8-rank 全组），但只有部分 rank 有 `num_dycp_reqs > 0`，导致 all_reduce 死锁。
+     - 修复：添加 `actual_cp_size > 1` 守卫，与 MLA 后端一致。
+
+  3. **添加 DYCP_NCCL 诊断日志**（所有 DyCP NCCL 集合操作前）：
+     - `mla/common.py`：prefill kv all_gather、prefill pcp_kv_allgather、decode lse all_reduce
+     - `cp_utils.py`：restore_slot_mapping all_gather、restore_hidden_states all_gather
+     - `gpu_model_runner.py`：post-forward restore_hidden_states
+     - `common.py`：dyncp_lse_out_ar all_reduce
+     - 日志包含 rank、cp_size、group world_size、token 数量，用于精确定位卡住的 NCCL 操作
+
+  **根因分析关键发现**：
+
+  - **CP=2-only 稳定但 CP=4/8 混合死锁的原因**：
+    - CP=2 时 `cp_size > 1 and cp_size < dycp_world_size` = `2 > 1 and 2 < 8` = TRUE → 使用 `get_dycp_subgroup(2)`
+    - 但 `dycp_world_size=8` 时，CP=2 有 4 个独立子组 `[0,1], [2,3], [4,5], [6,7]`
+    - CP=2-only 测试中所有 8 个 rank 都活跃（每个 rank 都在某个 CP=2 子组中），没有空闲 rank
+    - CP=4/8 混合测试中存在空闲 rank（不在任何 CP>1 子组中），导致 NCCL 组不匹配
+
+  - **MLA 后端守卫正确性确认**：
+    - `mla/common.py:2907`：`dycp_world_size > 1 and num_dycp_reqs > 0` + `cp_size > 1` → 空闲 rank 跳过 ✓
+    - `mla/common.py:3488`：`decode_dycp_reqs > 0 and actual_cp_size > 1` → decode 时跳过 ✓
+    - `mla/common.py:3277`：`full_dycp_prefill` 条件确保只在 prefill 时调用 ✓
+
+  - **仍需调查的可能原因**（MLA 后端已正确守卫，但死锁仍然发生）：
+    1. **MoE all-to-all 同步问题**：DeepSeek MoE 层使用 expert parallelism，all-to-all 需要 DP 组内所有 rank 参与。空闲 rank 的 `_dummy_run` 是否正确参与？
+    2. **`actual_cp_size` 传播到空闲 rank 的问题**：空闲 rank 的 `SchedulerOutput.make_empty()` 默认 `actual_cp_size=1`，与活跃 rank 的 `actual_cp_size=4` 不匹配。之前的修复尝试导致更快卡住（已回退）。
+    3. **某些未审计的 NCCL 操作路径**：可能存在未检查的 NCCL 集合操作，条件判断基于 per-rank 的 `actual_cp_size` 或 `num_dycp_reqs`。
+    4. **DP coordination all_reduce 与 DyCP 子组操作的时序问题**：空闲 rank 的 `_dummy_run` 和活跃 rank 的 `execute_model` 可能在不同时间调用 NCCL 操作。
+
+  **下一步**：
+  - 在远程机器上运行混合 CP 测试，启用 `VLLM_LOG_LEVEL=DEBUG` 捕获 DYCP_NCCL 日志
+  - 测试仅 CP=4 请求（无 CP=1/8）以缩小问题范围
+  - 如果 CP=4-only 也死锁，问题在 NCCL 子组内部；如果 CP=4-only 稳定，问题在空闲 rank 与活跃 rank 的交互
+  - 考虑添加 `NCCL_DEBUG=TRACE` 获取更详细的 NCCL 通信日志
 
 ### 2026-05-04 Session 29
 
