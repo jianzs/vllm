@@ -915,9 +915,12 @@ class CrossDPScheduler(Scheduler):
         # Next, schedule the WAITING requests.
         if not any(preempted_reqs):
             while self.waiting and max(rank_budgets) > 0:
-                if len(self.running) == (
-                    (self.max_num_running_reqs - self.waiting.running_long_count) * self.cp_world_size + self.waiting.running_long_count
-                ):
+                # Capacity check: break if no rank has room for any request.
+                # Under DyCP, the old formula (assuming each long request
+                # occupies all cp_world_size ranks) is too conservative.
+                # Use per-rank counts from request_manager instead.
+                if all(self.request_manager.num_req_per_dp[i] >= self.request_manager.max_num_seqs
+                       for i in range(self.cp_world_size)):
                     break
                 request = self.waiting.peek_request()
                 if request is None:
@@ -1225,9 +1228,10 @@ class CrossDPScheduler(Scheduler):
         assert all(b >= 0 for b in rank_budgets), (
             f"rank_budgets underflow: {rank_budgets}"
         )
-        assert len(self.running) <= (
-            (self.max_num_running_reqs - self.waiting.running_long_count) * self.cp_world_size + self.waiting.running_long_count
-        )
+        # Under DyCP, a CP>1 request only occupies cp_size ranks (not all
+        # cp_world_size), so the total unique request count is bounded by
+        # max_num_seqs * cp_world_size (all CP=1 scenario).
+        assert len(self.running) <= self.max_num_running_reqs * self.cp_world_size
         
         total_scheduled = (
             len(list(chain.from_iterable(scheduled_new_reqs)))
