@@ -46,6 +46,20 @@
 
   并发 PD 测试（4 请求）全部成功，路由正确（短请求 Direct，长请求 PD）。
 
+- **性能 Benchmark**（concurrency=2, 200 请求, 8K input, 50 output, 通过 proxy）：
+
+  | 指标 | Session 27 | Session 26 基线 |
+  |------|-----------|----------------|
+  | 成功/失败 | 200/0 ✓ | 200/0 ✓ |
+  | TTFT P50 | 781.76ms | 442.82ms* |
+  | TPOT P50 | 9.69ms | 10.09ms |
+  | TPOT P90 | 9.89ms | 14.63ms |
+  | TPOT P99 | 10.49ms | 15.43ms |
+  | ITL P50 | 8.82ms | 9.03ms |
+  | ITL P90 | 9.02ms | 10.39ms |
+
+  *注：Session 27 使用 8K input（CP=2），Session 26 使用混合 CP 负载（含 CP=1 4K），TTFT 不可直接对比。TPOT 和 ITL 均有改善，无性能回归。
+
 - **代码审查问题状态更新**：
 
   | 严重性 | 问题 | 状态 |
