@@ -831,7 +831,7 @@ class LocalPDConnector(KVConnectorBase_V1):
     ) -> None:
         """Load KV cache for decode requests."""
         metadata = self._get_connector_metadata()
-        logger.info(
+        logger.debug(
             "WORKER start_load_kv called: metadata type=%s, "
             "num_requests=%d, ipc_initialized=%s, cp_world_size=%d",
             type(metadata).__name__,
@@ -1263,7 +1263,7 @@ class LocalPDConnector(KVConnectorBase_V1):
     def wait_for_save(self):
         """In IPC mode: no-op. KV stays in each rank's paged buffer."""
         if not self._pending_local_kv:
-            logger.info("wait_for_save: IPC mode, no-op (0ms)")
+            logger.debug("wait_for_save: IPC mode, no-op (0ms)")
             return
 
     def get_finished(
