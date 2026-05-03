@@ -2,6 +2,39 @@
 
 ## 当前状态：代码审查与优化阶段
 
+### 2026-05-03 Session 24
+
+- **修复审查发现的 HIGH/MEDIUM 优先级问题**（commit `6ae09c6e8`）：
+
+  1. **Block 泄漏修复**（HIGH，local_pd_connector.py + cross_dp_scheduler.py）：
+     - 问题：`delay_free=True` 的 prefill blocks 在 decode 请求不到达时永远不会释放。orphan 清理（5 分钟超时）只删除 `_completed_prefills` 和 `_ipc_delayed_prefill_ids` 的 dict 条目，不释放 KV cache blocks。
+     - 修复：在 `build_connector_meta()` 的 orphan 清理中，将 prefill request ID 加入 `_orphaned_prefill_ids_to_free` 集合。调度器在 `build_connector_meta()` 返回后检查此集合并调用 `_free_blocks()` 释放 blocks。
+
+  2. **IPC memory handle 泄漏修复**（MEDIUM，local_pd_connector.py）：
+     - 问题：`register_kv_caches()` 中 `cudaIpcOpenMemHandle` 失败时，已打开的 handle 不关闭，泄漏 GPU 虚拟地址空间。
+     - 修复：用 try/except 包裹 handle 打开循环，失败时调用 `_close_ipc_handles()` 关闭已打开的 handle。同时在 `__del__` 中调用 `_close_ipc_handles()` 确保正常关闭时也能清理。
+
+  3. **单批次单 CP>1 尺寸约束**（cross_dp_scheduler.py）：
+     - 问题：NCCL all-gather/all-reduce 使用单个 `actual_cp_size`，混合不同 CP>1 尺寸（如 CP=2 和 CP=4）会导致错误的 NCCL 子组被使用。
+     - 修复：在调度开始时从 RUNNING 请求初始化 `dycp_batch_cp_size`。调度 WAITING 请求时，如果 CP>1 请求的 cp_size 与已调度的 CP>1 尺寸不同，则延迟该请求。这实现了设计文档约束："优先实现一个batch里面只会有一个size的CP"。
+
+- **评估 `actual_cp_size` batch 级覆盖问题**：
+  - 原审计标记为 HIGH：CP>1 decode 和 CP=1 decode 在不同 rank 上共存时，CP=1 decode 被强制使用 CP>1 的 attention 配置
+  - 经代码分析，这**不是正确性 bug**：`per_req_cp_sizes` 机制正确区分了每个请求的 CP size，CP=1 decode 使用 `per_req_cp_sizes[req_id]=1` 和 `cp_size=1`（CUDA graph key 中 `num_cp_tokens=0 → cp_size=1`），不参与 NCCL CP 通信
+  - `actual_cp_size` 仅用于 CP>1 请求的 NCCL 子组选择、PCPManager 操作和 logits indices 计算
+  - 降级为 MEDIUM-HIGH 性能问题（与 `dync_has_decode` 过于宽泛相关）
+
+- SSH 不可用，未进行远程测试
+
+#### 待完成
+
+- 高并发混合 CP size 性能测试（concurrency > 1）— 需要 SSH
+- 长时间稳定性测试 — 需要 SSH
+- 调度器性能优化：
+  - `dync_has_decode` 过于宽泛（MEDIUM-HIGH）：任何 decode（包括 CP=1）都会阻塞新 prefill
+  - 双标志 True 时调度死区（MEDIUM）：`dync_has_decode` 和 `dync_has_cp_prefill` 同时为 True 时新请求被完全阻塞
+- 低优先级清理：`_cross_requests_need_load` abort 泄漏、`_ipc_delayed_prefill_ids` 残留状态
+
 ### 2026-05-03 Session 23
 
 - **修复 Session 22 遗留 bug**（commit `ede0e1f03`）：
