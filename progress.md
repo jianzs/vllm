@@ -28,11 +28,22 @@
   2. **空闲 rank `_dummy_run` 与 `actual_cp_size` 不匹配**：空闲 rank 调用 `_dummy_run(1, uniform_decode=True)` 时 `actual_cp_size=1`（默认值），而活跃 rank 使用 `actual_cp_size=4` 或 `8`
   3. **NCCL 子组转换问题**：从 CP=4 子组切换到 CP=1 或 CP=8 子组时，NCCL 通信器状态可能不一致
 
+  **关键发现**：使用 `--enforce-eager` 禁用 CUDA graph 后，NCCL 死锁仍然发生。这排除了 CUDA graph 作为根因，确认问题在 NCCL 通信层面。
+
+  **Eager 模式测试结果**：
+  - 服务器启动正常，短请求（CP=1）和长请求（CP>1）均可单独完成
+  - 混合 CP 测试在 ~1 个请求后卡住
+  - 日志显示 "No available shared memory broadcast block found in 60 seconds"
+  - 模式：CP>1 prefill 完成后（4096 tokens/s），decode 开始但立即 0 吞吐
+
+  **对比**：CP=2-only 测试（2000 请求）完全稳定，无任何问题。问题仅在 CP>2（CP=4 或 CP=8）时出现。
+
   待调查方向：
-  - 使用 `--enforce-eager` 测试是否为 CUDA graph 问题
-  - 检查 CUDA graph capture 是否包含所有 CP size 的 decode graph
-  - 检查 `_dummy_run` 在空闲 rank 上的行为是否与活跃 rank 的 NCCL 通信兼容
-  - 添加更详细的 worker 级日志以定位卡住位置
+  - 检查 CP=4/8 的 NCCL 子组创建和使用是否正确
+  - 检查空闲 rank 的 `_dummy_run` 是否正确参与 MoE all-to-all
+  - 检查 CP>2 时 NCCL 子组对齐是否正确（rank 必须是 cp_size 的整数倍）
+  - 添加 NCCL 调试日志（`NCCL_DEBUG=TRACE`）定位卡住的通信操作
+  - 测试仅 CP=4 请求（无 CP=1/8）以缩小问题范围
 
 - **尝试修复 `actual_cp_size` 传播到空闲 rank**（已回退）：
 
