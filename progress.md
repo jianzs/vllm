@@ -32,10 +32,26 @@
 
 #### 待完成
 
-- 长时间稳定性测试（连续运行 1h+）
-- 1M 上下文测试（需要 YaRN 配置）
 - 调查 benchmark 工具在高并发 PD 请求下的异常延迟问题（非关键，手动测试已验证性能正常）
 - 代码清理：Session 17 代码审查问题 1（`get_total_num_req` 公式）在需要时修复
+
+#### 稳定性测试结果
+
+- **200 请求混合 CP 负载稳定性测试**（CP=1/2/4 混合，concurrency=1，通过 proxy）：
+  - 0 失败请求
+  - TTFT P50: 307ms, P90: 543ms, P99: 580ms
+  - TPOT P50: 9.18ms, P90: 10.45ms, P99: 10.55ms
+  - 总运行时间: 1043s（~17 分钟）
+  - 请求分布: CP=1: 124, CP=2: 35, CP=4: 41
+
+#### 1M 上下文测试结果
+
+- **200K tokens（CP=8）**：✓ 通过，TTFT=5.7s
+- **500K tokens（CP=8）**：✓ 通过，TTFT=19.5s
+- **1M tokens（CP=8）**：✓ 通过，TTFT=57.2s
+- **1M tokens + 100 decode（CP=8）**：✓ 通过，总时间=58.4s，TPOT≈12.1ms
+- YaRN 配置：`--hf-overrides '{"rope_parameters":{"rope_type":"yarn","factor":8.0,"original_max_position_embeddings":163840}}'`
+- 所有上下文长度均通过 PD proxy 正确处理（request ID 包含 "decode-pd"）
 
 ### 2026-05-03 Session 17
 
