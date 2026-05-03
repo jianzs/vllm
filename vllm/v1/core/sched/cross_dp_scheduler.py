@@ -668,6 +668,22 @@ class CrossDPScheduler(Scheduler):
         # DyCP: track per-request cp_size for the output
         per_req_cp_sizes: dict[str, int] = {}
 
+        # DyCP: enforce single CP>1 size per batch. The NCCL all-gather/
+        # all-reduce in both prefill and decode paths uses a single
+        # actual_cp_size for the entire batch. Mixing different CP>1 sizes
+        # would cause the wrong NCCL subgroup to be used for some requests.
+        # This constraint matches the design doc: "优先实现一个batch里面
+        # 只会有一个size的CP".
+        # Initialize from RUNNING requests to prevent mixing across steps.
+        dycp_batch_cp_size: int = 0
+        if self.dycp_enabled:
+            running_cp_sizes = {
+                len(req.cp_ranks) for req in self.running
+                if len(req.cp_ranks) > 1
+            }
+            if running_cp_sizes:
+                dycp_batch_cp_size = max(running_cp_sizes)
+
         # Per-rank token budgets: each rank can process up to
         # max_num_scheduled_tokens.  CP requests split tokens across ranks,
         # so their per-rank cost is num_tokens / cp_size.
@@ -942,6 +958,16 @@ class CrossDPScheduler(Scheduler):
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
                         continue
+                    # Enforce single CP>1 size per batch: if a CP>1
+                    # request was already scheduled with a different
+                    # cp_size, defer this request to avoid mixing CP
+                    # sizes in the same NCCL all-gather/all-reduce.
+                    if (req_cp_size > 1
+                            and dycp_batch_cp_size > 0
+                            and req_cp_size != dycp_batch_cp_size):
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
 
                 if len(request.cp_ranks) == 0:
                     selected_dp = self.request_manager.select_dp(
@@ -1102,6 +1128,8 @@ class CrossDPScheduler(Scheduler):
                 request.cp_ranks = selected_dp
                 if self.dycp_enabled:
                     per_req_cp_sizes[request.request_id] = req_cp_size
+                    if req_cp_size > 1 and dycp_batch_cp_size == 0:
+                        dycp_batch_cp_size = req_cp_size
 
                 """
                 TODO(AoChen): update_state_after_alloc(PD disagg) is not implemented yet.
@@ -1291,6 +1319,21 @@ class CrossDPScheduler(Scheduler):
                     scheduler_output
                 )
                 scheduler_output.kv_connector_metadata = meta
+
+            # Free blocks for orphaned prefill requests whose decode
+            # partner never arrived (timed out via orphan cleanup in
+            # build_connector_meta). Without this, blocks leak forever.
+            if hasattr(self.connector, '_orphaned_prefill_ids_to_free'):
+                for req_id in self.connector._orphaned_prefill_ids_to_free:
+                    if req_id in self.requests:
+                        logger.info(
+                            "Freeing orphaned prefill blocks for %s", req_id)
+                        self._free_blocks(self.requests[req_id])
+                    else:
+                        logger.debug(
+                            "Skipping orphaned prefill free for %s "
+                            "(already freed)", req_id)
+                self.connector._orphaned_prefill_ids_to_free.clear()
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             for scheduler_output in total_scheduler_output:

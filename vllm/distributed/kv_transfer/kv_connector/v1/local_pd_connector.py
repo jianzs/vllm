@@ -259,6 +259,9 @@ class LocalPDConnector(KVConnectorBase_V1):
             # Orphan cleanup: max seconds a completed prefill entry
             # lives without a matching decode request.
             self._orphan_timeout_s: float = 300.0
+            # Prefill req_ids whose blocks must be freed because their
+            # decode partner never arrived (orphan cleanup).
+            self._orphaned_prefill_ids_to_free: set[str] = set()
 
         if role == KVConnectorRole.WORKER:
             self._gpu_kv_buffer: dict[str, dict[str, torch.Tensor]] = {}
@@ -334,25 +337,32 @@ class LocalPDConnector(KVConnectorBase_V1):
             layer_handles[layer_name] = all_handles  # type: ignore[assignment]
 
         # Open remote handles and store raw pointers + metadata
-        for layer_name, kv_tensor in kv_caches.items():
-            elem_size = kv_tensor.element_size()
-            for src_rank in range(world_size):
-                if src_rank == my_rank:
-                    continue
+        try:
+            for layer_name, kv_tensor in kv_caches.items():
+                elem_size = kv_tensor.element_size()
+                for src_rank in range(world_size):
+                    if src_rank == my_rank:
+                        continue
 
-                handle_bytes = layer_handles[layer_name][src_rank]
-                handle = cudaIpcMemHandle_t()
-                ctypes.memmove(
-                    ctypes.byref(handle), handle_bytes, 128
-                )
-                remote_ptr = self._cuda_lib.cudaIpcOpenMemHandle(handle)
+                    handle_bytes = layer_handles[layer_name][src_rank]
+                    handle = cudaIpcMemHandle_t()
+                    ctypes.memmove(
+                        ctypes.byref(handle), handle_bytes, 128
+                    )
+                    remote_ptr = self._cuda_lib.cudaIpcOpenMemHandle(handle)
 
-                # Store raw pointer + metadata for cudaMemcpy at load time
-                self._remote_ipc_info.setdefault(
-                    src_rank, {}
-                )[layer_name] = (
-                    remote_ptr, kv_tensor.shape, kv_tensor.dtype, elem_size,
-                )
+                    # Store raw pointer + metadata for cudaMemcpy at load time
+                    self._remote_ipc_info.setdefault(
+                        src_rank, {}
+                    )[layer_name] = (
+                        remote_ptr, kv_tensor.shape, kv_tensor.dtype,
+                        elem_size,
+                    )
+        except Exception:
+            # Close already-opened handles to prevent GPU virtual address
+            # space leak if cudaIpcOpenMemHandle fails partway through.
+            self._close_ipc_handles()
+            raise
 
         # Create dedicated CUDA stream + event for async IPC transfers
         stream_ptr = ctypes.c_void_p()
@@ -707,11 +717,19 @@ class LocalPDConnector(KVConnectorBase_V1):
             for k in orphaned:
                 logger.warning(
                     "Cleaning orphaned prefill entry prefix=%s "
-                    "(no decode request after %.0fs)",
+                    "(no decode request after %.0fs), freeing blocks",
                     k, self._orphan_timeout_s,
                 )
-                self._completed_prefills.pop(k, None)
-                self._ipc_delayed_prefill_ids.pop(k, None)
+                meta = self._completed_prefills.pop(k, None)
+                prefill_req_id = self._ipc_delayed_prefill_ids.pop(k, None)
+                # Schedule the prefill request's blocks for freeing.
+                # The scheduler will pick this up via get_finished() and
+                # call _free_blocks() to release the KV cache blocks.
+                if prefill_req_id:
+                    self._orphaned_prefill_ids_to_free.add(prefill_req_id)
+                elif meta and meta.get("prefill_req_id"):
+                    self._orphaned_prefill_ids_to_free.add(
+                        meta["prefill_req_id"])
 
         # Only remove requests that were actually processed this step.
         # Unconditionally clearing loses registrations for requests that
@@ -1358,3 +1376,22 @@ class LocalPDConnector(KVConnectorBase_V1):
                     except Exception:
                         pass
             self._ipc_pending_events.clear()
+        # Close IPC memory handles to release GPU virtual address space.
+        self._close_ipc_handles()
+
+    def _close_ipc_handles(self) -> None:
+        """Close all opened IPC memory handles to release GPU VA space."""
+        if not (self._cuda_lib and hasattr(self, '_remote_ipc_info')
+                and self._remote_ipc_info):
+            return
+        close_fn = self._cuda_lib.funcs.get("cudaIpcCloseMemHandle")
+        if not close_fn:
+            return
+        for rank_info in self._remote_ipc_info.values():
+            for layer_info in rank_info.values():
+                ptr = layer_info[0]
+                try:
+                    self._cuda_lib.CUDART_CHECK(close_fn(ptr))
+                except Exception:
+                    pass
+        self._remote_ipc_info.clear()
