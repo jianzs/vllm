@@ -1430,6 +1430,9 @@ class GPUModelRunner(
         # recomputes everything with post-division values.
         # For DyCP pure decode (all CP query_len=1), no token splitting
         # happens, so we can use the standard path directly.
+        # NOTE: This assumes CP requests are at the front of the array
+        # (first num_cp_request entries). This is guaranteed by
+        # reorder_batch_to_split_cp_and_normal() which runs before this.
         _dycp_needs_pcp = (
             self.dycp_world_size > 1
             and scheduler_output.num_cp_request > 0

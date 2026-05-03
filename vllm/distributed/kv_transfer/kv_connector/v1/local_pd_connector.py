@@ -1342,3 +1342,15 @@ class LocalPDConnector(KVConnectorBase_V1):
             finished_sending if finished_sending else None,
             load_req_ids if load_req_ids else None,
         )
+
+    def __del__(self) -> None:
+        # Destroy pending CUDA events to prevent resource leaks on shutdown.
+        if self._cuda_lib and hasattr(self, '_ipc_pending_events'):
+            destroy_fn = self._cuda_lib.funcs.get("cudaEventDestroy")
+            for _, (event_ptr, _) in self._ipc_pending_events.items():
+                if destroy_fn and event_ptr:
+                    try:
+                        destroy_fn(event_ptr)
+                    except Exception:
+                        pass
+            self._ipc_pending_events.clear()
