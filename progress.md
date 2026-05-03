@@ -2,9 +2,73 @@
 
 ## 当前状态：稳定性测试通过，代码优化阶段
 
-### 2026-05-03 Session 26
+### 2026-05-03 Session 26（续）
 
-- **长时间稳定性测试通过**（800 请求，混合 CP 负载，通过 PD proxy）：
+- **修复 allgather 大小不匹配崩溃**（commit `bea665643`）：
+
+  问题：DyCP 启用时，当 batch 中所有请求都是 CP=1（actual_cp_size=1），代码仍进入 allgather 路径（因为 num_dycp_reqs > 0，CP=1 请求也有 cp_ranks）。allgather 使用 `get_dycp_group()`（8 个 rank），产生 8*toks 大小的 tensor，但 `cur_allgather_kvcache` 只分配了 cp_size=1 的大小（toks）。导致 RuntimeError: "The size of tensor a (4096) must match the size of tensor b (32768)"。
+
+  修复：当 actual_cp_size=1 时跳过 allgather，直接使用本地数据（CP=1 不需要跨 rank 通信）。
+
+  根因：concurrency=2 测试中，两个短请求（CP=1）同时 prefill 时触发此路径。concurrency=1 测试不会触发，因为同一时刻只有一个 prefill。
+
+- **修复 CP=1 prefill 进入 DyCP context parallel 路径**（commit `23a5c8cbe`, `98b31b57e`）：
+
+  问题：`can_use_dycp_context` 和 `can_use_dycp_prefill_context_local` 两个条件判断都缺少 `actual_cp_size > 1` 检查。当 DyCP 启用且所有请求为 CP=1 时（num_dycp_reqs > 0 但 actual_cp_size=1），代码进入 `_context_parallel_compute_prefill_context`，导致 `reorg_kvcache` 断言失败。
+
+  修复：在两处 `can_use_dycp_context` 判断中添加 `actual_cp_size > 1` 条件。当 actual_cp_size=1 时，使用标准 non-CP prefill 路径。
+
+- **并发测试通过**（concurrency=2, 200 请求, 混合 CP 负载, 通过 proxy）：
+
+  **测试配置**：DeepSeek-V2-Lite, 8×GPU, dp_per_domain=8, FLASHMLA, LocalPDConnector + Proxy, concurrency=2, request-rate=4
+
+  **结果**：
+  | 指标 | 值 |
+  |------|-----|
+  | 成功/失败 | 200/0 ✓ |
+  | TPOT P50 | 10.09ms |
+  | TPOT P90 | 14.63ms |
+  | TPOT P99 | 15.43ms |
+  | ITL P50 | 9.03ms |
+  | ITL P90 | 10.39ms |
+
+  **关键发现**：
+  - 0 失败请求，服务器无崩溃（测试期间）
+  - TPOT P50=10.09ms，比 concurrency=1 基线（8.90ms）高约 1.2ms，属于 PD 互斥调度的预期开销
+  - TPOT P90=14.63ms，P99=15.43ms，尾部延迟合理
+  - ITL P50=9.03ms，与 concurrency=1 基线对齐
+
+- **修复 NameError: kv_params 未定义**（commit `e06a09f71`）：
+
+  问题：`_is_long_request()` 重构时移除了调度路径中的 `kv_params = request.kv_transfer_params` 赋值，但 DyCP 调度路径中的 `do_remote_prefill` 检查仍引用 `kv_params`。
+
+  修复：恢复 `kv_params = request.kv_transfer_params` 赋值。
+
+- **并发测试结果**（concurrency=2, 200 请求, 混合 CP 负载, 通过 proxy）：
+
+  **注意**：第一次并发测试因 NameError 崩溃（kv_params 未定义），修复后第二次测试 200/200 成功，但 benchmark 工具无法正确解析 proxy 的 streaming 响应（output_tokens=0），导致 TPOT/TTFT 数据不可用。第三次测试（allgather 修复后）未运行，因为服务器在第二次测试完成后崩溃（allgather 大小不匹配）。
+
+  **服务器崩溃**：发生在所有请求完成之后，崩溃点在 `_context_parallel_compute_prefill_context` 的 `cur_allgather_kvcache.copy_(gathered)`，原因是 actual_cp_size=1 时 allgather 路径错误。已修复。
+
+- **代码审查发现**（记录备查，未修复）：
+
+  | 严重性 | 问题 | 说明 |
+  |--------|------|------|
+  | HIGH | CP>1 请求无法抢占 | 当所有运行请求都是 CP>1 且 KV cache 满时，调度器无法抢占任何请求，导致死锁直到 CP>1 请求自然完成 |
+  | HIGH | CP>1 decode 饥饿不同 CP size 的 prefill | `dync_batch_cp_size` 从所有运行中的 CP>1 请求（包括 decode 阶段）初始化，持续运行的 CP=4 decode 会永久阻塞 CP=2 prefill |
+  | MEDIUM | `running_long_count` 未按 CP size 加权 | CP=2 和 CP=8 请求各计为 1，但资源消耗差异巨大 |
+  | MEDIUM | `has_slot_for_long_request` 缓存非 DyCP 感知 | 缓存值检查所有 rank，但 DyCP 下的 `has_slot_for_cp_request` 已正确处理 |
+  | MEDIUM | `running_long_count` 外部变异风险 | 调度器直接修改 queue 的 `running_long_count`，新代码路径可能遗漏递减 |
+  | LOW | 容量检查未考虑 CP 对齐约束 | 逐 rank 容量检查通过，但 CP=2 请求需要对齐的 2 rank 子组，`select_dp` 返回 None 时才处理 |
+
+#### 待完成
+
+- 验证 allgather 修复后的并发测试（concurrency=2）
+- CP>1 抢占死锁问题（HIGH）— 需要设计抢占整个 CP 组的机制
+- CP>1 decode 饥饿不同 CP size prefill 问题（HIGH）— 需要老化/超时机制
+- 长时间稳定性测试（1h+ 连续运行）
+
+### 2026-05-03 Session 26
 
   **测试配置**：DeepSeek-V2-Lite, 8×GPU, dp_per_domain=8, FLASHMLA, LocalPDConnector + Proxy, concurrency=1, request-rate=2
 
