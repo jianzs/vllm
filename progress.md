@@ -27,6 +27,16 @@
 
 - **远程冒烟测试**：CP=1/2/4 请求均成功处理，无崩溃
 
+- **代码清理**：
+  - `local_pd_connector.py`：添加 `__del__` 方法，在 shutdown 时销毁 pending CUDA events 防止资源泄漏
+  - `gpu_model_runner.py`：为 `_dycp_needs_pcp` 添加注释，说明 CP 请求在数组前端的假设由 `reorder_batch_to_split_cp_and_normal()` 保证
+
+- **代码审查问题评估**：
+  - `get_padded_slot_mapping` 过度分配：**不适用** — 仅在 PCP>1 时触发，DyCP 下 PCP=1
+  - NCCL 子组跨 rank 校验：**低优先级** — 所有 rank 共享相同 `ParallelConfig`
+  - `_dycp_needs_pcp` 排序假设：**已添加注释** — 由 `reorder_batch_to_split_cp_and_normal()` 保证
+  - CUDA event 泄漏：**已修复** — 添加 `__del__` 清理方法
+
 #### 待完成
 
 - 高并发混合 CP size 性能测试（concurrency > 1）
