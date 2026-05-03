@@ -285,9 +285,18 @@ class LongShortRequestQueue(RequestQueue):
             request = self._queue[idx]
             
             if self.is_long_request(request):
-                # Check if we can schedule more long requests
-                if self.running_long_count >= self.max_long_requests or not self._has_slot_for_long_request(request):
-                    # Skip this long request, continue searching
+                # Check if we can schedule more long requests.
+                # In DyCP mode, skip the flat running_long_count limit:
+                # it's overly conservative because it counts each CP>1
+                # request as 1 regardless of cp_size (CP=2 uses 2 ranks,
+                # CP=8 uses 8).  The per-subgroup capacity check in
+                # _has_slot_for_long_request (via has_slot_for_cp_request)
+                # is the correct gate.
+                if (not self.dycp_sorted_thresholds
+                        and self.running_long_count
+                        >= self.max_long_requests):
+                    continue
+                if not self._has_slot_for_long_request(request):
                     continue
                 # Can schedule this long request
                 return self._pop_at_index(idx)
@@ -295,7 +304,7 @@ class LongShortRequestQueue(RequestQueue):
                 # Short request, can always schedule
                 return self._pop_at_index(idx)
 
-        # No schedulable request found (all are long requests and limit reached)
+        # No schedulable request found (all long requests and limit reached)
         raise IndexError("no schedulable request (all long requests blocked), and it is not reachable")
     
     def _pop_at_index(self, index: int) -> Request:
@@ -333,9 +342,14 @@ class LongShortRequestQueue(RequestQueue):
             request = self._queue[idx]
             
             if self.is_long_request(request):
-                # Check if we can schedule more long requests
-                if self.running_long_count >= self.max_long_requests or not self._has_slot_for_long_request(request):
-                    # Skip this long request, continue searching
+                # Check if we can schedule more long requests.
+                # In DyCP mode, skip the flat running_long_count limit
+                # (see pop_request for rationale).
+                if (not self.dycp_sorted_thresholds
+                        and self.running_long_count
+                        >= self.max_long_requests):
+                    continue
+                if not self._has_slot_for_long_request(request):
                     continue
                 # Can schedule this long request
                 return request
