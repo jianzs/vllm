@@ -1,6 +1,61 @@
 # DyCP Progress
 
-## 当前状态：稳定性测试通过，代码优化阶段
+## 当前状态：调度器修复完成，待长时间稳定性测试
+
+### 2026-05-04 Session 27
+
+- **修复 CP>1 抢占死锁**（commit `e98dd1527`，HIGH）：
+
+  问题：当 `self.running` 中最低优先级的请求是 CP>1 时，调度器立即 `break` 退出抢占循环，即使更高优先级位置存在可抢占的 CP=1 请求。当所有运行请求都是 CP>1 且 KV cache 满时，调度器完全无法抢占任何请求，导致死锁直到 CP>1 请求自然完成。
+
+  修复：当弹出的请求是 CP>1 时，将其放回 `self.running`，然后从末尾向前搜索第一个 CP=1 请求进行抢占。只有在所有运行请求都是 CP>1 时才 `break`。
+
+- **清理 `dycp_batch_cp_size` 初始化**（commit `e98dd1527`，HIGH → MEDIUM）：
+
+  问题：`dycp_batch_cp_size` 从所有运行中的 CP>1 请求（包括 decode 阶段）初始化。持续运行的 CP=4 decode 会使 `dyncp_batch_cp_size=4` 持续生效，阻止不同 CP size 的 prefill 被调度。
+
+  分析：实际上 `dync_has_decode` 标志已经阻止了 decode 运行时的新 prefill 调度，因此 `dyncp_batch_cp_size` 从 decode 初始化不会独立地阻止 prefill。但这是语义不正确的：decode 使用 per-request `per_req_cp_sizes` 进行 CUDA graph 选择，不参与 batch-level NCCL all-gather。包含 decode 会在 `dync_has_decode` 未来被放宽时导致 bug。
+
+  修复：`dyncp_batch_cp_size` 初始化时添加 `req.num_computed_tokens < req.num_prompt_tokens` 条件，仅包含 CP>1 prefill 请求，排除 decode 请求。
+
+- **冒烟测试通过**（DyCP + LocalPDConnector + Proxy）：
+
+  **直接请求测试**（concurrency=1）：
+  | CP Size | Input Tokens | 状态 | 耗时 |
+  |---------|-------------|------|------|
+  | CP=1 | 17 | ✓ | 0.46s |
+  | CP=2 | 3014 | ✓ | 0.59s |
+  | CP=4 | 12014 | ✓ | 1.06s |
+
+  **并发测试**（4 请求：2×CP=1 + 1×CP=2 + 1×CP=4）：
+  - 所有请求成功，无错误或崩溃
+  - 服务器日志无抢占警告
+
+  **PD Proxy 测试**（sequential + concurrent）：
+  | 路由 | CP Size | Input Tokens | 状态 | 耗时 |
+  |------|---------|-------------|------|------|
+  | Direct | CP=1 | 17 | ✓ | 0.69s |
+  | PD | CP=2 | 3014 | ✓ | 0.67s |
+  | PD | CP=4 | 12014 | ✓ | 1.30s |
+
+  并发 PD 测试（4 请求）全部成功，路由正确（短请求 Direct，长请求 PD）。
+
+- **代码审查问题状态更新**：
+
+  | 严重性 | 问题 | 状态 |
+  |--------|------|------|
+  | ~~HIGH~~ | ~~CP>1 请求无法抢占~~ | ✓ 已修复 |
+  | ~~HIGH~~ | ~~CP>1 decode 饥饿不同 CP size prefill~~ | ✓ 已修复（语义清理，实际由 `dync_has_decode` 保护） |
+  | MEDIUM | `running_long_count` 未按 CP size 加权 | 未修复 |
+  | MEDIUM | `has_slot_for_long_request` 缓存非 DyCP 感知 | 未修复 |
+  | MEDIUM | `running_long_count` 外部变异风险 | 未修复 |
+  | LOW | 容量检查未考虑 CP 对齐约束 | 未修复 |
+
+#### 待完成
+
+- 长时间稳定性测试（1h+ 连续运行）
+- MEDIUM 优先级问题修复（`running_long_count` 加权、缓存感知等）
+- 性能回归测试（concurrency=2+ benchmark 对比 Session 26 基线）
 
 ### 2026-05-03 Session 26（续）
 
