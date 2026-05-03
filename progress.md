@@ -1,8 +1,60 @@
 # DyCP Progress
 
-## 当前状态：代码清理与优化阶段
+## 当前状态：代码审查与优化阶段
 
-### 2026-05-03 Session 22
+### 2026-05-03 Session 23
+
+- **修复 Session 22 遗留 bug**（commit `ede0e1f03`）：
+  - Session 22 代码清理将 6 处内联 `import time as _time` 移到文件顶部时遗漏了顶部 import，导致 `register_kv_caches()` 运行时 `NameError: name '_time' is not defined`
+  - 修复：在 `local_pd_connector.py` 顶部添加 `import time as _time`
+
+- **代码审查**（commit `ce46ffa42`）：
+  系统性审查 DyCP 调度器和 KV 缓存代码，发现并修复以下问题：
+
+  1. **CUDA event 泄漏**（local_pd_connector.py）：`register_kv_caches` 中创建的 `self._ipc_event` 从未使用也从未销毁，浪费 GPU 资源。已移除。
+
+  2. **IPC load 静默数据损坏**（local_pd_connector.py）：`np.clip` 静默截断越界的 block 索引，decode 端可能从错误的 source block 拷贝 KV 数据而无任何错误提示。已改为显式边界检查 + 错误日志，0 blocks 时跳过该 rank。
+
+  3. **`_finish_time_ms` 设置顺序**（local_pd_connector.py）：先插入 `_completed_prefills` 字典再设置时间戳，如果 `get_num_new_matched_tokens` 在两行之间被调用，会读到缺失时间戳的条目。已改为先设置时间戳再插入。
+
+  4. **`num_req_per_cp_size` 缺少负数保护**（cross_dp_scheduler.py）：`free_req()` 中计数可能变为负数（如果 `add_req`/`free_req` 不匹配），导致 `get_total_num_req()` 返回错误值。已添加 assert 和零值清理。
+
+  5. **`per_req_cp_sizes` 和 `actual_cp_size` 非 DyCP 模式下不正确**（cross_dp_scheduler.py）：WAITING 请求循环中 `per_req_cp_sizes` 无条件填充，非 DyCP 模式下 `actual_cp_size` 可能被错误设为 >1。已添加 `self.dycp_enabled` guard。
+
+- **审查发现但未修复的问题（记录备查）**：
+
+  **调度器**：
+  | 严重性 | 问题 | 说明 |
+  |--------|------|------|
+  | HIGH | `actual_cp_size` 使用 max cp_size 覆盖整个 batch | 当 CP>1 decode 和 CP=1 decode 在不同 rank 上共存时，CP=1 decode 被强制使用 CP>1 的 attention 配置，产生错误结果。需要 per-rank `actual_cp_size` 彻底修复 |
+  | MEDIUM-HIGH | `dync_has_decode` 过于宽泛 | 任何 decode（包括 CP=1）都会阻塞新 prefill，导致高并发下 prefill 饥饿 |
+  | MEDIUM | 双标志 True 时调度死区 | `dync_has_decode` 和 `dync_has_cp_prefill` 同时为 True 时，新请求被完全阻塞直到 CP>1 prefill 完成 |
+  | LOW | 抢占后 CP=1 请求被强制回到原 rank | `select_dp` 对有 `cp_ranks` 的请求直接返回原 rank，不尝试其他可用 rank |
+
+  **KV 缓存**：
+  | 严重性 | 问题 | 说明 |
+  |--------|------|------|
+  | HIGH | Decode 未到达时 block 泄漏 | `delay_free=True` 的 prefill blocks 在 decode 请求不到达时永远不会释放，orphan 清理只删除 dict 条目不释放 blocks |
+  | MEDIUM | IPC event 无超时清理 | GPU 错误导致 CUDA event 永远不完成时，prefill blocks 永远不释放 |
+  | MEDIUM | IPC memory handle 泄漏 | `cudaIpcOpenMemHandle` 失败时已打开的 handle 不关闭，泄漏 GPU 虚拟地址空间 |
+  | LOW | `_cross_requests_need_load` 在 abort 时泄漏 | 被抢占或取消的请求在 dict 中留下条目 |
+  | LOW | `_ipc_delayed_prefill_ids` 是残留状态 | 被维护但从未被功能性地消费 |
+
+- **TTFT 测量调查**：
+  - 确认 benchmark 工具的 TTFT 测量逻辑正确：在第一个包含 token 的 SSE chunk 到达时捕获时间戳
+  - Proxy 流式转发正确：使用 `resp.content.iter_chunked(1024)` 流式转发 decode 响应
+  - Session 20 的 "TTFT 包含完整请求时间" 可能是误读或特定测试配置问题
+  - PD 模式下 TTFT = prefill 时间 + decode TTFT 是正确行为
+
+- SSH 不可用，未进行远程测试
+
+#### 待完成
+
+- 高并发混合 CP size 性能测试（concurrency > 1）— 需要 SSH
+- 长时间稳定性测试 — 需要 SSH
+- 修复 HIGH 优先级审查问题：
+  - Block 泄漏（decode 未到达时）— 需要在 orphan 清理中释放 blocks
+  - `actual_cp_size` batch 级覆盖问题 — 需要 per-rank actual_cp_size 设计
 
 - **代码清理**（commit `bee7e8cc5`）：
   1. **`cross_dp_scheduler.py`**：移除 `assert False` 崩溃守卫（`invalid_block_ids` 非空时会 crash 而非处理错误）；修复拼写错误的 assert 消息；移除未使用的 imports（`ast.Set`, `itertools`）；移除 3 处注释掉的代码块
