@@ -12,11 +12,17 @@
 
 - **清理 `dycp_batch_cp_size` 初始化**（commit `e98dd1527`，HIGH → MEDIUM）：
 
-  问题：`dycp_batch_cp_size` 从所有运行中的 CP>1 请求（包括 decode 阶段）初始化。持续运行的 CP=4 decode 会使 `dyncp_batch_cp_size=4` 持续生效，阻止不同 CP size 的 prefill 被调度。
+  问题：`dyncp_batch_cp_size` 从所有运行中的 CP>1 请求（包括 decode 阶段）初始化。持续运行的 CP=4 decode 会使 `dyncp_batch_cp_size=4` 持续生效，阻止不同 CP size 的 prefill 被调度。
 
   分析：实际上 `dync_has_decode` 标志已经阻止了 decode 运行时的新 prefill 调度，因此 `dyncp_batch_cp_size` 从 decode 初始化不会独立地阻止 prefill。但这是语义不正确的：decode 使用 per-request `per_req_cp_sizes` 进行 CUDA graph 选择，不参与 batch-level NCCL all-gather。包含 decode 会在 `dync_has_decode` 未来被放宽时导致 bug。
 
   修复：`dyncp_batch_cp_size` 初始化时添加 `req.num_computed_tokens < req.num_prompt_tokens` 条件，仅包含 CP>1 prefill 请求，排除 decode 请求。
+
+- **修复 `running_long_count` 扁平计数过于保守**（commit `193244f2d`，MEDIUM）：
+
+  问题：`running_long_count >= max_long_requests` 检查将每个 CP>1 请求计为 1，不考虑 cp_size。当 `num_cp_seqs=2` 时，2 个 CP=2 请求（使用 4/8 rank）就会阻止所有后续长请求，即使还有 4 个 rank 空闲。
+
+  修复：DyCP 模式下跳过 `running_long_count >= max_long_requests` 检查，仅依赖 `has_slot_for_cp_request(cp_size)` 的逐子组容量检查。非 DyCP 模式保留原有行为。
 
 - **冒烟测试通过**（DyCP + LocalPDConnector + Proxy）：
 
@@ -46,9 +52,9 @@
   |--------|------|------|
   | ~~HIGH~~ | ~~CP>1 请求无法抢占~~ | ✓ 已修复 |
   | ~~HIGH~~ | ~~CP>1 decode 饥饿不同 CP size prefill~~ | ✓ 已修复（语义清理，实际由 `dync_has_decode` 保护） |
-  | MEDIUM | `running_long_count` 未按 CP size 加权 | 未修复 |
-  | MEDIUM | `has_slot_for_long_request` 缓存非 DyCP 感知 | 未修复 |
-  | MEDIUM | `running_long_count` 外部变异风险 | 未修复 |
+  | ~~MEDIUM~~ | ~~`running_long_count` 未按 CP size 加权~~ | ✓ 已修复（DyCP 模式跳过扁平计数，使用逐子组容量检查） |
+  | MEDIUM | `has_slot_for_long_request` 缓存非 DyCP 感知 | 未修复（DyCP 模式已绕过缓存，影响极小） |
+  | MEDIUM | `running_long_count` 外部变异风险 | 未修复（低风险，仅 PD decode 长请求场景） |
   | LOW | 容量检查未考虑 CP 对齐约束 | 未修复 |
 
 #### 待完成
