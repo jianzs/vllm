@@ -81,13 +81,22 @@
 
 - SSH 不可用，未进行远程测试
 
+- **远程冒烟测试通过**：
+  - CP=1（短请求）：✓ 直接请求和 proxy 均正常
+  - CP=2（~4800 tokens）：✓ proxy PD 流程正常，TTFT=0.47s
+  - CP=4（~17600 tokens）：✓ proxy PD 流程正常，TTFT=1.21s
+  - CP=8（~36000 tokens）：✓ proxy PD 流程正常，TTFT=2.01s
+  - 混合 CP size 并发测试（CP=1/2/4/8 同时）：✓ 全部成功，无错误
+  - 服务器日志无异常（仅标准启动警告）
+
 #### 待完成
 
 - 高并发混合 CP size 性能测试（concurrency > 1）— 需要 SSH
 - 长时间稳定性测试 — 需要 SSH
-- 修复 HIGH 优先级审查问题：
-  - Block 泄漏（decode 未到达时）— 需要在 orphan 清理中释放 blocks
-  - `actual_cp_size` batch 级覆盖问题 — 需要 per-rank actual_cp_size 设计
+- 调度器性能优化：
+  - `dync_has_decode` 过于宽泛（MEDIUM-HIGH）：任何 decode（包括 CP=1）都会阻塞新 prefill
+  - 双标志 True 时调度死区（MEDIUM）：`dync_has_decode` 和 `dync_has_cp_prefill` 同时为 True 时新请求被完全阻塞
+- 低优先级清理：`_cross_requests_need_load` abort 泄漏
 
 - **代码清理**（commit `bee7e8cc5`）：
   1. **`cross_dp_scheduler.py`**：移除 `assert False` 崩溃守卫（`invalid_block_ids` 非空时会 crash 而非处理错误）；修复拼写错误的 assert 消息；移除未使用的 imports（`ast.Set`, `itertools`）；移除 3 处注释掉的代码块
