@@ -285,6 +285,12 @@ class CrossDPScheduler(Scheduler):
         # a preempted request is later cancelled via finish_requests().
         self._active_req_ids: set[str] = set()
 
+        # When a CP>1 request is preempted, cp_ranks is cleared so the
+        # re-scheduled request goes through DyCP-aware rank selection.
+        # Save the original cp_ranks here so that _free_request can still
+        # notify the correct worker ranks if the request is later cancelled.
+        self._preempted_cp_ranks: dict[str, list[int]] = {}
+
     def _is_long_request(self, request: Request) -> bool:
         """Classify a request as long or short, applying PD overrides.
 
@@ -357,8 +363,16 @@ class CrossDPScheduler(Scheduler):
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
-        for cp_rank in request.cp_ranks:    
+        # Use saved preempted cp_ranks if the request was preempted
+        # (which clears cp_ranks). This ensures worker ranks are
+        # notified that the request is finished even if it was
+        # cancelled while in the preempted/waiting state.
+        finished_cp_ranks = request.cp_ranks or self._preempted_cp_ranks.pop(
+            request_id, [])
+        for cp_rank in finished_cp_ranks:
             self.finished_req_ids[cp_rank].add(request_id)
+        # Clean up saved cp_ranks if they were used
+        self._preempted_cp_ranks.pop(request_id, None)
 
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
@@ -683,8 +697,16 @@ class CrossDPScheduler(Scheduler):
         num_scheduled_tokens: list[dict[str, int]] = [{} for _ in range(self.cp_world_size)]
         cp_rank_scheduled_tokens: list[dict[str, int]] = [{} for _ in range(self.cp_world_size)]
 
-        # DyCP: track per-request cp_size for the output
+        # DyCP: track per-request cp_size for the output.
+        # Pre-populate from ALL running requests so that actual_cp_size
+        # is correct even if some running requests are skipped in the
+        # scheduling loop (e.g. num_new_tokens == 0 due to budget
+        # exhaustion or async scheduling).
         per_req_cp_sizes: dict[str, int] = {}
+        if self.dycp_enabled:
+            for req in self.running:
+                if len(req.cp_ranks) > 1:
+                    per_req_cp_sizes[req.request_id] = len(req.cp_ranks)
 
         # DyCP: enforce single CP>1 size per batch. The NCCL all-gather/
         # all-reduce in both prefill and decode paths uses a single
@@ -881,6 +903,12 @@ class CrossDPScheduler(Scheduler):
 
                     for rank in preempted_req.cp_ranks:
                         preempted_reqs[rank].append(preempted_req)
+                    # Save original cp_ranks before clearing so that
+                    # _free_request can notify the correct worker ranks
+                    # if the request is later cancelled while preempted.
+                    if preempted_req.cp_ranks:
+                        self._preempted_cp_ranks[preempted_req.request_id] = (
+                            list(preempted_req.cp_ranks))
                     # Clear cp_ranks so the re-scheduled request goes
                     # through DyCP-aware rank selection instead of
                     # trying stale ranks that may now be occupied.
@@ -1183,6 +1211,9 @@ class CrossDPScheduler(Scheduler):
                 
                 self.running.append(request)
                 self._active_req_ids.add(request.request_id)
+                # Clean up saved preempted cp_ranks since the request
+                # has been re-scheduled with new cp_ranks.
+                self._preempted_cp_ranks.pop(request.request_id, None)
                 self.waiting.running_long_count += 1 if is_long else 0
                 self.request_manager.add_req(request)
                 self.waiting.has_slot_for_long_request = self.request_manager.has_slot_for_long_request()
