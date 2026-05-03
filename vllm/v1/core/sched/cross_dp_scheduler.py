@@ -58,6 +58,15 @@ from vllm.v1.core.sched.scheduler import Scheduler
 
 logger = init_logger(__name__)
 
+# Maximum consecutive scheduling steps where decode makes zero progress
+# before force-allowing prefills. This prevents permanent deadlock when a
+# decode request is stuck (e.g., NCCL hang, KV transfer stall) while
+# still allowing normal decode to run without interference.
+# Normal decode generates 1 token/step, so even short outputs take many
+# steps. A stall count of 50 means ~50 seconds of zero progress before
+# the escape hatch triggers (at ~1 step/second for decode).
+_DYCP_STALL_LIMIT = 50
+
 class RequestManager:
     def __init__(
         self,
@@ -290,6 +299,13 @@ class CrossDPScheduler(Scheduler):
         # Save the original cp_ranks here so that _free_request can still
         # notify the correct worker ranks if the request is later cancelled.
         self._preempted_cp_ranks: dict[str, list[int]] = {}
+
+        # Escape hatch for dycp_has_decode deadlock: track whether decode
+        # requests are making progress. If decode stalls for
+        # _DYCP_STALL_LIMIT consecutive steps (zero new tokens computed),
+        # force-allow prefills to prevent permanent deadlock.
+        self._dycp_stall_count: int = 0
+        self._last_decode_computed: int = 0
 
     def _is_long_request(self, request: Request) -> bool:
         """Classify a request as long or short, applying PD overrides.
@@ -943,12 +959,35 @@ class CrossDPScheduler(Scheduler):
         # forces all ranks to synchronize, so decode ranks would wait for
         # slower prefill ranks, degrading TPOT from ~7ms to ~80ms.
         # Instead, defer prefill to the next step.
+        # ESCAPE HATCH: if decode makes zero progress for
+        # _DYCP_STALL_LIMIT consecutive steps (stuck due to NCCL hang,
+        # KV transfer stall, etc.), force-allow prefills to prevent
+        # permanent deadlock. We track total computed tokens of decode
+        # requests to distinguish normal progress from a true stall.
         dycp_has_decode = (
             self.dycp_enabled
             and any(
                 req.num_computed_tokens >= req.num_prompt_tokens
                 for req in self.running
             )
+        )
+        if dycp_has_decode:
+            total_decode_computed = sum(
+                req.num_computed_tokens
+                for req in self.running
+                if req.num_computed_tokens >= req.num_prompt_tokens
+            )
+            if total_decode_computed == self._last_decode_computed:
+                self._dycp_stall_count += 1
+            else:
+                self._dycp_stall_count = 0
+            self._last_decode_computed = total_decode_computed
+        else:
+            self._dycp_stall_count = 0
+            self._last_decode_computed = 0
+        dycp_defer_prefills = (
+            dycp_has_decode
+            and self._dycp_stall_count < _DYCP_STALL_LIMIT
         )
         # Check if any running request is a CP>1 prefill (still computing
         # prompt tokens). PD decode requests must wait for these to finish
@@ -961,6 +1000,12 @@ class CrossDPScheduler(Scheduler):
                 for req in self.running
             )
         )
+        if dycp_has_decode and self._dycp_stall_count >= _DYCP_STALL_LIMIT:
+            logger.warning(
+                "DyCP decode stall detected (%d steps with zero progress): "
+                "force-allowing prefills despite active decode. "
+                "Decode may be stuck (NCCL hang or KV transfer stall).",
+                self._dycp_stall_count)
 
         # Use a temporary RequestQueue to collect requests that need to be
         # skipped and put back at the head of the waiting queue later
@@ -1002,7 +1047,9 @@ class CrossDPScheduler(Scheduler):
                     # PD decode requests (do_remote_prefill) load KV via IPC
                     # memory copy, not a full prefill forward pass, so they
                     # don't cause MoE sync issues and should not be deferred.
-                    if (dycp_has_decode and num_prompt_tokens > 0
+                    # After _DYCP_DEFER_LIMIT consecutive deferrals, force-
+                    # allow prefills to prevent deadlock when decode is stuck.
+                    if (dycp_defer_prefills and num_prompt_tokens > 0
                             and not (kv_params
                                      and kv_params.get("do_remote_prefill"))):
                         self.waiting.pop_request()
@@ -1332,7 +1379,7 @@ class CrossDPScheduler(Scheduler):
                          {k: v for k, v in per_req_cp_sizes.items() if v > 1})
 
         for idx in range(self.cp_world_size):
-            
+
             if sum(num_scheduled_tokens[idx].values()) == 0 and len(preempted_reqs[idx]) == 0 and len(self.finished_req_ids[idx]) == 0:
                 scheduler_output = SchedulerOutput.make_empty()
                 scheduler_output.none_tokens_in_peer_sched = none_tokens_in_peer_sched

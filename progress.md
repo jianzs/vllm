@@ -1,6 +1,112 @@
 # DyCP Progress
 
-## 当前状态：调度器修复完成，待长时间稳定性测试
+## 当前状态：混合 CP size 稳定性测试发现 Worker 级 NCCL 死锁
+
+### 2026-05-04 Session 29
+
+- **发现并修复调度器级 `dyncp_has_decode` 死锁**：
+
+  问题：`dyncp_has_decode` 标志在有任何 decode 请求运行时阻止所有新 prefill 请求调度。如果 decode 请求卡住（如 NCCL 死锁或 KV 传输停滞），系统永久死锁：1 个 running 请求 0 吞吐，3+ 个 waiting 请求无法调度。
+
+  修复：添加基于进度的停滞检测器。跟踪 running decode 请求的 `num_computed_tokens` 总和，如果连续 `_DYCP_STALL_LIMIT`（50）步无进展，则强制允许 prefill 调度。这区分了正常 decode（每步生成 token）和真正卡住的 decode（0 吞吐）。
+
+  **注意**：初步实现的步数计数器（`_DYCP_DEFER_LIMIT=20`）在正常 decode 期间就触发（50 output tokens = ~50 步 defer），导致 prefill 和 decode 混合在同一步中，引发 MoE all-to-all 同步问题。改为基于进度的检测后，仅在 decode 真正停滞时触发。
+
+- **发现 Worker 级 NCCL 死锁**（未修复，阻塞混合 CP 测试）：
+
+  现象：混合 CP size（CP=1/4/8）测试在 ~10 个请求后卡住。服务器日志显示 "No available shared memory broadcast block found in 60 seconds"，worker 进程卡在 NCCL 通信中。
+
+  关键观察：
+  - CP=2-only 测试（2000 请求）完全稳定，无任何问题
+  - 混合 CP 测试（CP=1/4/8）在 2 分钟内卡住
+  - 卡住前日志：1 running, 2 waiting, 0 吞吐, 0% KV cache
+  - `dyncp_has_decode` 停滞检测器未触发（0 警告），因为卡住在 worker 级而非调度器级
+  - 调度器无法检测到 worker 级 NCCL 死锁
+
+  可能原因：
+  1. **CUDA graph 与混合 CP size 不兼容**：当 `actual_cp_size` 在步间变化时（如 CP=4 prefill → CP=1 decode），CUDA graph replay 可能使用错误的 NCCL communicator
+  2. **空闲 rank `_dummy_run` 与 `actual_cp_size` 不匹配**：空闲 rank 调用 `_dummy_run(1, uniform_decode=True)` 时 `actual_cp_size=1`（默认值），而活跃 rank 使用 `actual_cp_size=4` 或 `8`
+  3. **NCCL 子组转换问题**：从 CP=4 子组切换到 CP=1 或 CP=8 子组时，NCCL 通信器状态可能不一致
+
+  待调查方向：
+  - 使用 `--enforce-eager` 测试是否为 CUDA graph 问题
+  - 检查 CUDA graph capture 是否包含所有 CP size 的 decode graph
+  - 检查 `_dummy_run` 在空闲 rank 上的行为是否与活跃 rank 的 NCCL 通信兼容
+  - 添加更详细的 worker 级日志以定位卡住位置
+
+- **尝试修复 `actual_cp_size` 传播到空闲 rank**（已回退）：
+
+  尝试将 `actual_cp_size` 从调度器传播到空闲 rank 的 `SchedulerOutput.make_empty()` 和 `_dummy_run()`。但此修复导致更快的卡住（在 escape hatch 触发后立即卡住），因为混合 prefill/decode 步中 `actual_cp_size` 不匹配加剧了 NCCL 问题。已回退此修复。
+
+- **Session 28 混合 CP 测试结果**（859/1000 后卡住）：
+
+  在 Session 28 的混合 CP 测试（1000 请求：670×CP=1, 190×CP=4, 140×CP=8）中，测试在 859/1000 时卡住约 1 小时。服务器显示 1 running, 3 waiting, 0 吞吐。这是 `dyncp_has_decode` 死锁的首次实际触发。
+
+#### 待完成
+
+- **P0**：修复 Worker 级 NCCL 死锁（混合 CP size 测试的阻塞问题）
+- 混合 CP size 长时间稳定性测试（当前被 NCCL 死锁阻塞）
+- MEDIUM 优先级问题修复（`has_slot_for_long_request` 缓存、`running_long_count` 变异风险）
+- 性能回归测试（concurrency=2+ benchmark 对比 Session 26 基线）
+
+### 2026-05-04 Session 28
+
+- **代码审查发现并修复 2 个调度器正确性问题**（commit `17447aa66`）：
+
+  1. **`per_req_cp_sizes` 缺少被跳过的 RUNNING 请求条目**（HIGH）：
+     - 问题：当 RUNNING 请求在调度循环中被跳过（如 `num_new_tokens == 0` 因预算耗尽或异步调度）时，其 `cp_size` 未记录到 `per_req_cp_sizes`。导致 `actual_cp_size` 计算错误，可能向模型运行器发送错误的 NCCL 子组大小。
+     - 修复：在调度循环之前，从所有 RUNNING 请求预填充 `per_req_cp_sizes`。
+
+  2. **`finished_req_ids` 未为被抢占后取消的 CP>1 请求填充**（HIGH）：
+     - 问题：CP>1 请求被抢占后，`cp_ranks` 被清空（用于 DyCP 感知的重新调度）。如果请求随后在等待队列中被取消，`_free_request` 遍历 `request.cp_ranks`（此时为空）通知 worker ranks，导致没有 rank 被通知请求已完成。这会泄漏模型运行器在原始 CP ranks 上的状态。
+     - 修复：在清空 `cp_ranks` 之前保存原始 `cp_ranks` 到 `_preempted_cp_ranks` 字典，在 `_free_request` 中当 `cp_ranks` 为空时使用保存的值。请求重新调度时清理保存的值。
+
+- **稳定性测试**（2000 请求，8K input，50 output，concurrency=4，通过 proxy）：
+
+  **测试配置**：DeepSeek-V2-Lite, 8×GPU, dp_per_domain=8, FLASHMLA, LocalPDConnector + Proxy, concurrency=4, request-rate=4, 8K input (CP=2), 50 output
+
+  **结果**：
+  | 指标 | 值 |
+  |------|-----|
+  | 成功/失败 | 2000/0 ✓ |
+  | 持续时间 | 602.3s (~10 min) |
+  | 吞吐量 | 3.32 req/s, 27365 tok/s |
+  | TTFT P50 | 752.64ms |
+  | TTFT P90 | 759.76ms |
+  | TTFT P99 | 794.08ms |
+  | TPOT P50 | 9.07ms |
+  | TPOT P90 | 10.05ms |
+  | TPOT P99 | 10.47ms |
+  | ITL P50 | 9.01ms |
+  | ITL P90 | 9.25ms |
+  | ITL P99 | 11.80ms |
+
+  **关键发现**：
+  - 0 失败请求，2000/2000 全部成功
+  - TPOT P50=9.07ms 与 Session 26 基线（8.90ms）接近，无性能回归
+  - TPOT P90=10.05ms, P99=10.47ms，尾部延迟稳定
+  - ITL P50=9.01ms 与 Session 26 基线对齐
+  - 服务器无 CUDA 错误、无 OOM、无抢占警告
+  - 注：所有请求为 8K input（CP=2），TTFT 不可与 Session 26 混合 CP 负载直接对比
+
+- **代码审查问题状态更新**：
+
+  | 严重性 | 问题 | 状态 |
+  |--------|------|------|
+  | ~~HIGH~~ | ~~CP>1 请求无法抢占~~ | ✓ 已修复（Session 27） |
+  | ~~HIGH~~ | ~~CP>1 decode 饥饿不同 CP size prefill~~ | ✓ 已修复（Session 27） |
+  | ~~MEDIUM~~ | ~~`running_long_count` 未按 CP size 加权~~ | ✓ 已修复（Session 27） |
+  | ~~HIGH~~ | ~~`per_req_cp_sizes` 缺少被跳过的 RUNNING 请求~~ | ✓ 已修复（Session 28） |
+  | ~~HIGH~~ | ~~`finished_req_ids` 未为被抢占后取消的 CP>1 请求填充~~ | ✓ 已修复（Session 28） |
+  | MEDIUM | `has_slot_for_long_request` 缓存非 DyCP 感知 | 未修复（DyCP 模式已绕过缓存，影响极小） |
+  | MEDIUM | `running_long_count` 外部变异风险 | 未修复（低风险，`_active_req_ids` 防止双重递减） |
+  | LOW | 容量检查未考虑 CP 对齐约束 | 未修复 |
+
+#### 待完成
+
+- 混合 CP size 长时间稳定性测试（当前测试仅 CP=2，需测试 CP=1/2/4/8 混合负载）
+- MEDIUM 优先级问题修复（`has_slot_for_long_request` 缓存、`running_long_count` 变异风险）
+- 性能回归测试（concurrency=2+ benchmark 对比 Session 26 基线）
 
 ### 2026-05-04 Session 27
 
