@@ -247,7 +247,7 @@ class CrossDPKVCacheCoordinatorNoPrefixCache:
                 manager_blocks = manager.req_to_blocks.get(request_id, [])
                 rank_blocks.append(manager_blocks)
             
-            if any(rank_blocks) is not None:
+            if any(rank_blocks):
                 blocks_by_rank.append(tuple(rank_blocks))
         
         return blocks_by_rank

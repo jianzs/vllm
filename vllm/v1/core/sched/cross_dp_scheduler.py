@@ -771,6 +771,12 @@ class CrossDPScheduler(Scheduler):
                             # Cannot preempt CP>1 requests; put back and
                             # skip to avoid inconsistent state.
                             self.running.append(preempted_req)
+                            logger.warning(
+                                "Cannot preempt CP>1 request %s "
+                                "(cp_ranks=%d). All running requests "
+                                "are CP>1; waiting for one to finish.",
+                                preempted_req.request_id,
+                                len(preempted_req.cp_ranks))
                             break
                         self._active_req_ids.discard(preempted_req.request_id)
                         self.request_manager.free_req(preempted_req)

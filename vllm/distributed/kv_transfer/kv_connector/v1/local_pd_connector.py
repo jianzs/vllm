@@ -255,6 +255,9 @@ class LocalPDConnector(KVConnectorBase_V1):
             self._completed_prefills: dict[str, dict[str, Any]] = {}
             # IPC: {prefix: prefill_request_id} for delayed block freeing
             self._ipc_delayed_prefill_ids: dict[str, str] = {}
+            # Orphan cleanup: max seconds a completed prefill entry
+            # lives without a matching decode request.
+            self._orphan_timeout_s: float = 300.0
 
         if role == KVConnectorRole.WORKER:
             self._gpu_kv_buffer: dict[str, dict[str, torch.Tensor]] = {}
@@ -699,6 +702,26 @@ class LocalPDConnector(KVConnectorBase_V1):
             "build_connector_meta cp_rank=%d: %d store, %d load requests",
             cp_rank, store_count, load_count,
         )
+
+        # Cleanup orphaned _completed_prefills entries whose decode
+        # partner never arrived. Safe to remove because decode requests
+        # carry their own metadata via kv_transfer_params fallback.
+        if cp_rank == 0 and self._completed_prefills:
+            import time as _time
+            now_ms = _time.monotonic() * 1000
+            orphaned = [
+                k for k, v in self._completed_prefills.items()
+                if now_ms - v.get("_finish_time_ms", now_ms)
+                > self._orphan_timeout_s * 1000
+            ]
+            for k in orphaned:
+                logger.warning(
+                    "Cleaning orphaned prefill entry prefix=%s "
+                    "(no decode request after %.0fs)",
+                    k, self._orphan_timeout_s,
+                )
+                self._completed_prefills.pop(k, None)
+                self._ipc_delayed_prefill_ids.pop(k, None)
 
         # Only remove requests that were actually processed this step.
         # Unconditionally clearing loses registrations for requests that
