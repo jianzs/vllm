@@ -197,8 +197,7 @@ class RequestManager:
         return False
 
     def __repr__(self) -> str:
-        return (f"RequestManager(cp_world_size={self.cp_world_size}"
-                + f"max_num_seqs={self.max_num_seqs}"
+        return (f"RequestManager(cp_world_size={self.cp_world_size}, "
                 + f"max_num_seqs={self.max_num_seqs}, "
                 + f"num_long_req_per_domain={self.num_long_req_per_domain}, "
                 + f"num_req_per_dp={self.num_req_per_dp})")
@@ -286,6 +285,23 @@ class CrossDPScheduler(Scheduler):
         # a preempted request is later cancelled via finish_requests().
         self._active_req_ids: set[str] = set()
 
+    def _is_long_request(self, request: Request) -> bool:
+        """Classify a request as long or short, applying PD overrides.
+
+        PD decode requests always use CP=1 (single rank). PD prefill
+        requests without DyCP also use CP=1 because the decode side
+        loads KV with cp_world_size=1. When DyCP is enabled, the
+        threshold logic determines the correct cp_size.
+        """
+        is_long = self.waiting.is_long_request(request)
+        kv_params = request.kv_transfer_params
+        if kv_params and kv_params.get("do_remote_prefill"):
+            is_long = False
+        elif kv_params and kv_params.get("do_remote_decode"):
+            if not self.dycp_enabled:
+                is_long = False
+        return is_long
+
     def _update_after_schedule(
         self,
         scheduler_output: SchedulerOutput,
@@ -332,11 +348,7 @@ class CrossDPScheduler(Scheduler):
             # PD requests are classified as short (CP=1) at schedule time,
             # so they must also be classified as short at free time to keep
             # running_long_count consistent.
-            kv_params = request.kv_transfer_params
-            is_long = (self.waiting.is_long_request(request)
-                       and not (kv_params and kv_params.get("do_remote_prefill"))
-                       and not (kv_params and kv_params.get("do_remote_decode")
-                                and not self.dycp_enabled))
+            is_long = self._is_long_request(request)
             self.waiting.running_long_count -= 1 if is_long else 0
             self.request_manager.free_req(request)
             self.waiting.has_slot_for_long_request = \
@@ -843,11 +855,7 @@ class CrossDPScheduler(Scheduler):
                             break
                         self._active_req_ids.discard(preempted_req.request_id)
                         self.request_manager.free_req(preempted_req)
-                        _kv_params = preempted_req.kv_transfer_params
-                        _is_long = (self.waiting.is_long_request(preempted_req)
-                                    and not (_kv_params and _kv_params.get("do_remote_prefill"))
-                                    and not (_kv_params and _kv_params.get("do_remote_decode")
-                                             and not self.dycp_enabled))
+                        _is_long = self._is_long_request(preempted_req)
                         self.waiting.running_long_count -= 1 if _is_long else 0
                         self.waiting.has_slot_for_long_request = self.request_manager.has_slot_for_long_request()
 
@@ -926,18 +934,7 @@ class CrossDPScheduler(Scheduler):
                 if request is None:
                     break
 
-                is_long = self.waiting.is_long_request(request)
-
-                # PD requests: decode always uses CP=1; prefill without
-                # DyCP also uses CP=1 (single rank) because the decode
-                # side loads KV with cp_world_size=1.  When DyCP is enabled,
-                # the threshold logic determines the correct cp_size.
-                kv_params = request.kv_transfer_params
-                if kv_params and kv_params.get("do_remote_prefill"):
-                    is_long = False
-                elif kv_params and kv_params.get("do_remote_decode"):
-                    if not self.dycp_enabled:
-                        is_long = False
+                is_long = self._is_long_request(request)
 
                 # DyCP: determine cp_size from thresholds
                 req_cp_size = 1
@@ -982,18 +979,11 @@ class CrossDPScheduler(Scheduler):
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
-                if len(request.cp_ranks) == 0:
-                    selected_dp = self.request_manager.select_dp(
-                        request, is_long,
-                        rank_budgets=rank_budgets,
-                        cp_size=req_cp_size if self.dycp_enabled else 0,
-                    )
-                else:
-                    selected_dp = self.request_manager.select_dp(
-                        request, is_long,
-                        rank_budgets=rank_budgets,
-                        cp_size=req_cp_size if self.dycp_enabled else 0,
-                    )
+                selected_dp = self.request_manager.select_dp(
+                    request, is_long,
+                    rank_budgets=rank_budgets,
+                    cp_size=req_cp_size if self.dycp_enabled else 0,
+                )
                 if selected_dp is None:
                     break
                 
