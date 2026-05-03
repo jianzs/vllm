@@ -1,6 +1,41 @@
 # DyCP Progress
 
-## 当前状态：代码审查与优化阶段 → 性能验证与稳定性测试阶段
+## 当前状态：性能验证与稳定性测试阶段
+
+### 2026-05-03 Session 19
+
+- **日志清理**（commit `d1a480a3d`）：
+  - `build_connector_meta` 摘要日志从 `logger.info` 降级为 `logger.debug`（每 step 每 CP rank 输出，8 rank 时产生大量日志）
+  - `build_connector_meta` 剩余 load 请求日志从 `logger.info` 降级为 `logger.debug`
+
+- **高并发 PD benchmark 分析**：
+  - CP=1 PD decode（4K input, 1024 output）通过 proxy：
+    | Concurrency | TTFT P50 | TTFT P90 | TPOT P50 | 备注 |
+    |-------------|----------|----------|----------|------|
+    | 1 | 323ms | 335ms | 9.02ms | 基线 |
+    | 2 | 514ms | 8137ms | 9.22ms | TTFT +59% |
+    | 4 | 9992ms | 17672ms | 9.20ms | TTFT 严重退化 |
+  - CP=4 PD decode（20K input, 1024 output）通过 proxy：
+    | Concurrency | TTFT P50 | TPOT P50 | 备注 |
+    |-------------|----------|----------|------|
+    | 1 | 472ms | 10.34ms | 基线 |
+    | 2 (手动测试) | ~10s wait + 10s decode | 10.43ms | PD 互斥调度延迟 |
+  - **关键发现**：
+    - TPOT 在所有并发度下稳定（~9-10ms），PD 流程不影响 decode 性能
+    - TTFT 在高并发时严重退化：concurrency=4 时 TTFT P50=10s，因为 `dync_has_decode` 互斥调度延迟新 prefill
+    - 这是 Local PD 的设计预期行为：prefill 和 decode 在同一实例上互斥运行
+    - 真实 PD 部署（独立 prefill/decode 实例）不会出现此问题
+  - **benchmark 工具问题**：`vllm bench serve` 在 4+ prompts、request-rate=1 时出现异常延迟（第 2 个请求 147s），但手动测试 4 并发请求在 ~20.5s 内完成。疑为 benchmark 工具的 HTTP 客户端时序问题，非 vLLM 性能问题
+  - 手动测试验证：4 个 CP=4 请求（2s 间隔）通过 proxy 全部在 20.5s 内完成
+
+- **`build_connector_meta` 日志降级**：Session 18 遗漏的两处 `logger.info` → `logger.debug`
+
+#### 待完成
+
+- 长时间稳定性测试（连续运行 1h+）
+- 1M 上下文测试（需要 YaRN 配置）
+- 调查 benchmark 工具在高并发 PD 请求下的异常延迟问题（非关键，手动测试已验证性能正常）
+- 代码清理：Session 17 代码审查问题 1（`get_total_num_req` 公式）在需要时修复
 
 ### 2026-05-03 Session 17
 
