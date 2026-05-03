@@ -2,6 +2,68 @@
 
 ## 当前状态：代码审查与优化阶段
 
+### 2026-05-03 Session 25
+
+- **调度器性能问题深度分析**：
+
+  1. **`dync_has_decode` 过于宽泛（MEDIUM-HIGH）— 确认为设计权衡，非 bug**：
+     - 任何 decode（包括 CP=1）运行时阻塞新 prefill，导致高并发下 prefill 饥饿
+     - 深度分析确认这是正确行为：MoE all-to-all 强制所有 DP rank 同步，即使 CP=1 decode（1 token）与 prefill（多 token）混合也会导致 TPOT 从 ~9ms 退化到 ~80ms（Session 7/8 实测数据）
+     - v1 修复仅阻塞 CP>1 decode 时的 prefill，TPOT 仍为 81ms；v2 修复扩展到所有 decode，TPOT 降至 9.17ms
+     - TTFT 退化是 Local PD 的设计预期，真实 PD 部署（独立 prefill/decode 实例）不会出现此问题
+     - 可能的优化方向（未实现，风险较高）：允许每 N 步调度一次 prefill、限制 decode 步数后强制调度 prefill、但会导致 TPOT 周期性退化
+
+  2. **双标志 True 时调度死区（MEDIUM）— 确认为临时条件，非永久死锁**：
+     - `dync_has_decode=True` + `dync_has_cp_prefill=True` 时，新 prefill 被 `dync_has_decode` 阻塞，新 PD decode 被 `dync_has_cp_prefill` 阻塞
+     - 这是临时条件：CP>1 prefill 完成后 `dync_has_cp_prefill=False`，PD decode 可调度；所有 decode 完成后 `dync_has_decode=False`，新 prefill 可调度
+     - 死区持续时间 = min(CP>1 prefill 剩余步数, decode 剩余步数)，通常为 2-5 个 chunked prefill 步骤
+     - 两个阻塞条件都是正确性必需：`dync_has_decode` 防止 MoE all-to-all TPOT 退化，`dync_has_cp_prefill` 防止 PD decode 被强制使用错误的 `actual_cp_size`
+
+- **修复 `_cross_requests_need_load` abort 泄漏**（local_pd_connector.py）：
+  - 问题：PD decode 请求在 `update_state_after_alloc` 注册后、`build_connector_meta` 处理前被取消（如客户端断连），`_cross_requests_need_load` 中的条目永远不会被清理，导致内存泄漏
+  - 修复：在 `request_finished()` 的 `do_remote_prefill` 分支中，清理 `_cross_requests_need_load` 中该请求的条目
+  - 实际发生概率极低（取消窗口在同一个 `schedule()` 调用内），但属于正确性修复
+
+- **`_ipc_delayed_prefill_ids` 评估**：
+  - 确认功能正常：在 orphan 清理路径中用于查找 prefill request ID 以释放 blocks
+  - 与 `_completed_prefills["prefill_req_id"]` 冗余，但移除风险大于收益，保持现状
+
+- **高并发 PD 性能测试**（DeepSeek-V2-Lite, 8×GPU, dp_per_domain=8, FLASHMLA, LocalPDConnector + Proxy）：
+
+  **CP=1 PD Decode Benchmark（output=128）**:
+  | Concurrency | TTFT P50 | TTFT P90 | TPOT P50 | TPOT P90 | 备注 |
+  |-------------|----------|----------|----------|----------|------|
+  | 1 | 290ms | 299ms | 9.02ms | 9.13ms | 基线 |
+  | 2 | 511ms | 550ms | 9.03ms | 9.40ms | TTFT +76% |
+  | 4 | 1712ms | 1720ms | 8.94ms | 8.99ms | TTFT +490% |
+
+  **CP=1 PD Decode Benchmark（output=50）**:
+  | Concurrency | TTFT P50 | TTFT P90 | TPOT P50 | 备注 |
+  |-------------|----------|----------|----------|------|
+  | 2 | 442ms | 679ms | 9.02ms | 短输出基线 |
+
+  **混合 CP=1+CP=4 PD Decode Benchmark（output=50, 75% CP=1 + 25% CP=4）**:
+  | Concurrency | Request Rate | TTFT P50 | TTFT P90 | TPOT P50 | 备注 |
+  |-------------|-------------|----------|----------|----------|------|
+  | 1 | 1 | 291ms | 439ms | 8.97ms | 与 CP=1 基线对齐 |
+  | 2 | 1 | 291ms | 528ms | 9.01ms | 与 CP=1 基线对齐 |
+  | 4 | 2 | — | — | — | 超时（dync_has_decode 序列化） |
+
+  **关键发现**:
+  - TPOT 在所有并发度下稳定（~9ms），`dync_has_decode` 不影响 decode 性能
+  - TTFT 随并发度增加而退化：c=1 → c=2 (+76%) → c=4 (+490%)
+  - 混合 CP size 在低并发下 TTFT/TPOT 与 CP=1 基线对齐
+  - 高并发（c=4）下 `dync_has_decode` 导致 prefill 请求排队等待，TTFT 严重退化
+  - 这是 Local PD 的设计预期：prefill 和 decode 在同一实例上互斥运行，真实 PD 部署不会出现此问题
+  - concurrency=4 混合 CP size 测试超时：`dync_has_decode` + 长 prefill 时间（CP=4, 20K tokens）导致严重序列化
+
+#### 待完成
+
+- 长时间稳定性测试 — 需要 SSH
+- 调度器性能优化（设计权衡，非 bug）：
+  - `dync_has_decode` 过于宽泛：已确认为正确行为，TTFT 退化是 Local PD 设计预期
+  - 双标志调度死区：已确认为临时条件，两个阻塞条件都是正确性必需
+
 ### 2026-05-03 Session 24
 
 - **修复审查发现的 HIGH/MEDIUM 优先级问题**（commit `6ae09c6e8`）：

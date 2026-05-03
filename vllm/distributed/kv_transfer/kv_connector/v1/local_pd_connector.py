@@ -849,6 +849,13 @@ class LocalPDConnector(KVConnectorBase_V1):
             self._completed_prefills.pop(prefix, None)
             self._prefill_requests.pop(request.request_id, None)
             self._ipc_delayed_prefill_ids.pop(prefix, None)
+            # Clean up any stale load registration. If the request was
+            # cancelled or preempted after update_state_after_alloc but
+            # before build_connector_meta processed it, the entry would
+            # otherwise leak indefinitely.
+            for cp_rank in request.cp_ranks:
+                self._cross_requests_need_load[cp_rank].pop(
+                    request.request_id, None)
             return False, None
 
         return False, None
