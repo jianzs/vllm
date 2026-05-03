@@ -1,6 +1,67 @@
 # DyCP Progress
 
-## 当前状态：代码审查与优化阶段
+## 当前状态：稳定性测试通过，代码优化阶段
+
+### 2026-05-03 Session 26
+
+- **长时间稳定性测试通过**（800 请求，混合 CP 负载，通过 PD proxy）：
+
+  **测试配置**：DeepSeek-V2-Lite, 8×GPU, dp_per_domain=8, FLASHMLA, LocalPDConnector + Proxy, concurrency=1, request-rate=2
+
+  **请求分布**：CP=1 (4K): 391, CP=2 (8K): 168, CP=4 (20K): 158, CP=8 (40K): 83, output=50 tokens each
+
+  **结果**：
+  | 指标 | 值 |
+  |------|-----|
+  | 成功/失败 | 800/0 ✓ |
+  | TTFT P50 | 442.82ms |
+  | TTFT P90 | 584.05ms |
+  | TTFT P99 | 608.30ms |
+  | TPOT P50 | 8.90ms |
+  | TPOT P90 | 10.31ms |
+  | TPOT P99 | 10.61ms |
+  | ITL P50 | 8.88ms |
+  | 总吞吐 | 13979.74 tok/s |
+
+  **关键发现**：
+  - 0 失败请求，所有 CP size 稳定工作
+  - TPOT 在所有 CP size 下稳定（P50=8.90ms, P90=10.31ms）
+  - TTFT 分布合理，P99 仅比 P50 高 37%
+  - 服务器无 CUDA 错误、无 OOM、无异常
+
+- **修复容量公式过于保守**（commit `5717d4398`）：
+
+  问题：`len(self.running) == (max_num_running_reqs - running_long_count) * cp_world_size + running_long_count` 假设每个长请求占用所有 `cp_world_size` 个 rank。DyCP 下 CP=4 请求只占用 4 个 rank（不是 8），公式过于保守，可能过早拒绝新请求。
+
+  修复：
+  1. 容量检查改为使用 `request_manager.num_req_per_dp` 的逐 rank 检查：当所有 rank 都达到 `max_num_seqs` 时才认为满载
+  2. 运行中请求数断言放宽为 `max_num_running_reqs * cp_world_size`（全 CP=1 场景的上界）
+
+- **代码清理**（commit `3561ebeaf`）：
+
+  1. 提取 `_is_long_request()` 辅助方法，集中 `is_long` 分类 + PD 覆盖逻辑。之前在 3 处重复（free 路径、preempt 路径、schedule 路径），维护风险高
+  2. 移除 `select_dp` 调用处的死 `if/else` 分支——两个分支调用参数完全相同
+  3. 修复 `RequestManager.__repr__` 格式错误：缺少逗号、`max_num_seqs` 重复
+
+- **修复 `start_local_pd.sh` 中的环境变量拼写错误**：`VLLM_USE_FORCE_LOAD_BLANCE` → 注释掉（该变量导致模型输出退化）
+
+- **代码审查发现**（记录备查，未修复）：
+
+  | 严重性 | 问题 | 说明 |
+  |--------|------|------|
+  | HIGH | CP>1 请求无法抢占 | 当所有运行请求都是 CP>1 且 KV cache 满时，调度器无法抢占任何请求，导致死锁直到 CP>1 请求自然完成 |
+  | HIGH | CP>1 decode 饥饿不同 CP size 的 prefill | `dync_batch_cp_size` 从所有运行中的 CP>1 请求（包括 decode 阶段）初始化，持续运行的 CP=4 decode 会永久阻塞 CP=2 prefill |
+  | MEDIUM | `running_long_count` 未按 CP size 加权 | CP=2 和 CP=8 请求各计为 1，但资源消耗差异巨大 |
+  | MEDIUM | `has_slot_for_long_request` 缓存非 DyCP 感知 | 缓存值检查所有 rank，但 DyCP 下的 `has_slot_for_cp_request` 已正确处理 |
+  | MEDIUM | `running_long_count` 外部变异风险 | 调度器直接修改 queue 的 `running_long_count`，新代码路径可能遗漏递减 |
+  | LOW | 容量检查未考虑 CP 对齐约束 | 逐 rank 容量检查通过，但 CP=2 请求需要对齐的 2 rank 子组，`select_dp` 返回 None 时才处理 |
+
+#### 待完成
+
+- 更高并发度 PD benchmark（concurrency=2）验证容量公式修复效果
+- CP>1 抢占死锁问题（HIGH）— 需要设计抢占整个 CP 组的机制
+- CP>1 decode 饥饿不同 CP size prefill 问题（HIGH）— 需要老化/超时机制
+- 长时间稳定性测试（1h+ 连续运行）
 
 ### 2026-05-03 Session 25
 
