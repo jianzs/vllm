@@ -692,12 +692,21 @@ class CrossDPScheduler(Scheduler):
         # would cause the wrong NCCL subgroup to be used for some requests.
         # This constraint matches the design doc: "优先实现一个batch里面
         # 只会有一个size的CP".
-        # Initialize from RUNNING requests to prevent mixing across steps.
+        # Initialize from RUNNING CP>1 prefill requests only.
+        # Decode requests are excluded because: (1) dync_has_decode
+        # already blocks all prefills when any decode is running, so
+        # dycp_batch_cp_size from decode never independently blocks
+        # prefills; (2) decode uses per-request per_req_cp_sizes for
+        # CUDA graph selection, not batch-level actual_cp_size for
+        # NCCL subgroup; (3) including decode would prevent different
+        # CP-size prefills from being scheduled after decode finishes,
+        # even though the NCCL constraint no longer applies.
         dycp_batch_cp_size: int = 0
         if self.dycp_enabled:
             running_cp_sizes = {
                 len(req.cp_ranks) for req in self.running
                 if len(req.cp_ranks) > 1
+                and req.num_computed_tokens < req.num_prompt_tokens
             }
             if running_cp_sizes:
                 dycp_batch_cp_size = max(running_cp_sizes)
@@ -843,16 +852,25 @@ class CrossDPScheduler(Scheduler):
                     else:
                         preempted_req = self.running.pop()
                         if len(preempted_req.cp_ranks) > 1:
-                            # Cannot preempt CP>1 requests; put back and
-                            # skip to avoid inconsistent state.
+                            # Cannot preempt CP>1 requests (would leave
+                            # other ranks in the CP group in an
+                            # inconsistent state).  Put it back and
+                            # search for a CP=1 request instead.
                             self.running.append(preempted_req)
-                            logger.warning(
-                                "Cannot preempt CP>1 request %s "
-                                "(cp_ranks=%d). All running requests "
-                                "are CP>1; waiting for one to finish.",
-                                preempted_req.request_id,
-                                len(preempted_req.cp_ranks))
-                            break
+                            preempted_req = None
+                            # Search backward (lowest priority first)
+                            # for a preemptible CP=1 request.
+                            for i in range(len(self.running) - 1,
+                                           -1, -1):
+                                if len(self.running[i].cp_ranks) <= 1:
+                                    preempted_req = self.running.pop(i)
+                                    break
+                            if preempted_req is None:
+                                logger.warning(
+                                    "Cannot preempt: all running "
+                                    "requests are CP>1. Waiting "
+                                    "for one to finish.")
+                                break
                         self._active_req_ids.discard(preempted_req.request_id)
                         self.request_manager.free_req(preempted_req)
                         _is_long = self._is_long_request(preempted_req)
