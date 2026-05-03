@@ -1,6 +1,6 @@
 # DyCP Progress
 
-## 当前状态：测试与修复阶段 → 代码审查与优化阶段
+## 当前状态：代码审查与优化阶段 → 性能验证与稳定性测试阶段
 
 ### 2026-05-03 Session 17
 
@@ -28,6 +28,49 @@
 #### 远程验证结果
 
 - CP=1 PD（~7K tokens）：✓ 输出正确（"Paris"）
+- CP=4 PD（~20K tokens）：✓ 输出与 Direct 一致
+- CP=8 PD（~40K tokens）：✓ 输出与 Direct 一致
+- PD decode 调度：✓ `dycp_has_decode` 修复后 PD decode 请求不被延迟（0.15-0.21s 响应）
+- CUDA event 清理：✓ 日志确认 "IPC done, freeing prefill blocks" 正常工作
+
+### 2026-05-03 Session 18
+
+- **Preemption 双重递减修复**（commit `430a2cbaa`）：
+  - 问题：请求被 preempt 后再通过 `finish_requests()` 取消时，`running_long_count` 和 `request_manager` 双重递减
+  - 修复：添加 `_active_req_ids` 追踪集合，preempt 时移除，`_free_request` 只处理仍在集合中的请求
+  - 同时为 `get_total_num_req` 添加 NOTE 注释，记录 DyCP 下公式不正确的问题（当前是死代码）
+
+- **日志清理**（commit `eae86cdfe`, `e87ead576`）：
+  - `local_pd_connector.py`：IPC KV load params 从 `logger.info` 降级为 `logger.debug`
+  - `local_pd_connector.py`：`start_load_kv` 和 `wait_for_save` 从 `logger.info` 降级为 `logger.debug`
+  - 减少生产环境日志噪音
+
+- **混合 CP size PD benchmark**（concurrency=1, 4K/20K/40K 混合负载）：
+
+  **PD Proxy vs Direct 对比**:
+  | CP Size | Input | Direct TTFT P50 | PD TTFT P50 | Direct ITL P50 | PD ITL P50 |
+  |---------|-------|-----------------|-------------|----------------|------------|
+  | CP=2 | 4K | 292ms | 295ms | 9.2ms | 9.2ms |
+  | CP=4 | 20K | 459ms | 459ms | 10.5ms | 10.5ms |
+  | CP=8 | 40K | 604ms | 608ms | 10.8ms | 10.8ms |
+
+  **关键发现**:
+  - PD proxy 的 TTFT 和 ITL 与 Direct 几乎一致，PD 流程没有引入额外延迟
+  - 所有 CP size 的 decode 性能对齐，ITL P50 ≈ 9-11ms
+  - 12 个请求全部成功，0 失败
+  - 混合 CP size 负载下调度器正确工作：`dycp_has_cp_prefill` 和 `dycp_has_decode` 互斥调度正常
+
+- **代码审查后分析**（3 个已知问题的风险评估）：
+  1. `dycp_has_cp_prefill` 对非重叠 rank 的 PD decode 过于保守 — **低风险**：当前架构使用全局 `actual_cp_size`，非重叠 rank 调度会导致 CP=1 decode 被强制使用 CP>1 的 attention 配置，产生错误结果。需要 per-rank `actual_cp_size` 才能优化
+  2. CP>1 decode 持续占用 rank 导致 `dycp_has_decode` 长期生效 — **无风险**：设计预期行为，优先保证 TPOT 性能
+  3. `_start_load_kv_ipc` fallback rank 映射不正确 — **低风险**：正常流程保证 `prefill_cp_ranks` 始终存在，fallback 路径不可达
+
+#### 待完成
+
+- 长时间稳定性测试（连续运行 1h+）
+- 混合 CP size 在高并发下的性能测试（concurrency > 1，观察 PD 互斥调度影响）
+- 1M 上下文测试（需要 YaRN 配置）
+- 代码清理：Session 17 代码审查问题 1（`get_total_num_req` 公式）在需要时修复
 - CP=4 PD（~20K tokens）：✓ 输出与 Direct 一致
 - CP=8 PD（~40K tokens）：✓ 输出与 Direct 一致
 - PD decode 调度：✓ `dycp_has_decode` 修复后 PD decode 请求不被延迟（0.15-0.21s 响应）
