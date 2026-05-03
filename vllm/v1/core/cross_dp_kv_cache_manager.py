@@ -247,7 +247,9 @@ class CrossDPKVCacheCoordinatorNoPrefixCache:
                 manager_blocks = manager.req_to_blocks.get(request_id, [])
                 rank_blocks.append(manager_blocks)
             
-            if any(rank_blocks):
+            # Always append: the list must have one entry per rank so that
+            # CrossDPKVCacheManager.get_blocks can index by rank number.
+            if True:  # any(rank_blocks) is not None
                 blocks_by_rank.append(tuple(rank_blocks))
         
         return blocks_by_rank
