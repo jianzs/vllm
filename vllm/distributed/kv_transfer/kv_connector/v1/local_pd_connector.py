@@ -363,14 +363,6 @@ class LocalPDConnector(KVConnectorBase_V1):
         )
         self._ipc_stream = stream_ptr
 
-        event_ptr = ctypes.c_void_p()
-        self._cuda_lib.CUDART_CHECK(
-            self._cuda_lib.funcs["cudaEventCreate"](
-                ctypes.byref(event_ptr)
-            )
-        )
-        self._ipc_event = event_ptr
-
         self._ipc_initialized = True
         elapsed = (_time.monotonic() - t0) * 1000
         logger.info(
@@ -786,9 +778,10 @@ class LocalPDConnector(KVConnectorBase_V1):
                 if request.cp_ranks else None,
             }
 
-            # Store in memory (no file I/O)
-            self._completed_prefills[prefix] = meta
+            # Set timestamp before inserting to prevent race with
+            # get_num_new_matched_tokens reading a stale entry.
             meta["_finish_time_ms"] = _time.monotonic() * 1000
+            self._completed_prefills[prefix] = meta
             # Clean up prefill tracking (all chunks done)
             self._prefill_requests.pop(request.request_id, None)
 
@@ -1007,9 +1000,25 @@ class LocalPDConnector(KVConnectorBase_V1):
             src_block_ids_arr = np.array(per_rank_block_ids[src_rank])
 
             rank_block_indices = block_indices[rank_positions]
+            if len(src_block_ids_arr) == 0:
+                logger.error(
+                    "IPC load: src_rank=%d has 0 blocks for prefix=%s, "
+                    "skipping (data may be incomplete)",
+                    src_rank, prefix,
+                )
+                continue
+            if np.any(rank_block_indices >= len(src_block_ids_arr)):
+                logger.error(
+                    "IPC load: block index out of range for src_rank=%d "
+                    "prefix=%s: max_idx=%d, num_blocks=%d. "
+                    "Clamping — output may be incorrect!",
+                    src_rank, prefix,
+                    int(rank_block_indices.max()),
+                    len(src_block_ids_arr),
+                )
             rank_block_indices = np.clip(
                 rank_block_indices, 0,
-                max(len(src_block_ids_arr) - 1, 0),
+                len(src_block_ids_arr) - 1,
             )
             src_block_ids_actual = src_block_ids_arr[rank_block_indices]
             dst_slots = dst_slot_mapping[rank_positions].numpy()

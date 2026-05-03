@@ -143,6 +143,12 @@ class RequestManager:
         cp_size = len(request.cp_ranks)
         self.num_req_per_cp_size[cp_size] = \
             self.num_req_per_cp_size.get(cp_size, 0) - 1
+        assert self.num_req_per_cp_size[cp_size] >= 0, (
+            f"num_req_per_cp_size[{cp_size}] went negative: "
+            f"{self.num_req_per_cp_size[cp_size]}"
+        )
+        if self.num_req_per_cp_size[cp_size] == 0:
+            del self.num_req_per_cp_size[cp_size]
 
         for rank in request.cp_ranks:
             self.num_req_per_dp[rank] -= 1
@@ -1094,7 +1100,8 @@ class CrossDPScheduler(Scheduler):
                 # This information is used to determine if a load is
                 # needed for this request.
                 request.cp_ranks = selected_dp
-                per_req_cp_sizes[request.request_id] = req_cp_size
+                if self.dycp_enabled:
+                    per_req_cp_sizes[request.request_id] = req_cp_size
 
                 """
                 TODO(AoChen): update_state_after_alloc(PD disagg) is not implemented yet.
@@ -1231,7 +1238,11 @@ class CrossDPScheduler(Scheduler):
         none_tokens_in_peer_sched = all([sum(num_scheduled_tokens[idx].values()) == 0 for idx in range(self.cp_world_size)])
 
         # DyCP: compute batch-level actual_cp_size (max across all scheduled reqs)
-        actual_cp_size = max(per_req_cp_sizes.values()) if per_req_cp_sizes else 1
+        # Only meaningful when DyCP is enabled; non-DyCP batches use cp_size=1.
+        if self.dycp_enabled and per_req_cp_sizes:
+            actual_cp_size = max(per_req_cp_sizes.values())
+        else:
+            actual_cp_size = 1
         if self.dycp_enabled and actual_cp_size > 1:
             logger.debug("DyCP: actual_cp_size=%d, per_req_cp_sizes=%s",
                          actual_cp_size,
