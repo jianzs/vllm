@@ -3348,6 +3348,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         if has_prefill:
             can_use_dycp_prefill_context_local = (
                 self.dycp_world_size > 1
+                and attn_metadata.actual_cp_size > 1
                 and attn_metadata.num_dycp_reqs > 0
                 and attn_metadata.prefill is not None
                 and attn_metadata.prefill.chunked_context is not None
