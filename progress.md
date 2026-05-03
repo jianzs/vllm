@@ -2,6 +2,23 @@
 
 ## 当前状态：代码清理与优化阶段
 
+### 2026-05-03 Session 22
+
+- **代码清理**（commit `bee7e8cc5`）：
+  1. **`cross_dp_scheduler.py`**：移除 `assert False` 崩溃守卫（`invalid_block_ids` 非空时会 crash 而非处理错误）；修复拼写错误的 assert 消息；移除未使用的 imports（`ast.Set`, `itertools`）；移除 3 处注释掉的代码块
+  2. **`local_pd_connector.py`**：将 6 处内联 `import time as _time` 移到文件顶部；将 10 处每个请求的 `logger.info` 降级为 `logger.debug`，减少生产环境日志噪音
+  3. **`local_pd_proxy.py`**：将每个请求的 `logger.info` 降级为 `logger.debug`；重构 `_handle_pd_request` 为委托到 `_handle_pd_request_with_body`，消除 ~80 行重复代码
+  4. **`mla/common.py`**：移除注释掉的 DyCP metadata force-split 代码
+  5. **`gpu_model_runner.py`**：移除注释掉的 slot_mapping 调用
+
+- SSH 不可用，未进行远程测试
+
+#### 待完成
+
+- 高并发混合 CP size 性能测试（concurrency > 1）
+- Streaming TTFT 测量修复
+- 长时间稳定性测试
+
 ### 2026-05-03 Session 21
 
 - **修复 1：`has_slot_for_long_request` 阻塞较小 CP 子组**：
