@@ -1,6 +1,61 @@
 # DyCP Progress
 
-## 当前状态：NCCL 死锁已修复，稳定性验证通过
+## 当前状态：混合 CP size 性能 benchmark 阶段
+
+### 2026-05-04 Session 32
+
+- **目标**：运行混合 CP size 性能 benchmark，验证 DyCP 核心价值
+- **完成**：
+  1. ✅ 修复 `local_pd_connector.py` meta 变量遮蔽 bug（commit `0e424a9e8`）
+  2. ✅ 修复 NCCL 死锁：`dycp_batch_cp_size` 初始化需包含 decode 请求（commit `e142318e7`）
+  3. ✅ 验证并发 CP=4+CP=2 请求不再死锁
+  4. ✅ 运行单 CP size decode benchmark（CP=1, CP=2, CP=4）
+
+**Bug 修复详情**：
+
+1. **`local_pd_connector.py` meta 变量遮蔽**：
+   - 问题：orphan cleanup 中 `meta = self._completed_prefills.pop(k)` 遮蔽了外层 `LocalPDConnectorMetadata` 变量
+   - 症状：`AttributeError: 'dict' object has no attribute 'requests'`
+   - 修复：重命名为 `orphan_meta`
+
+2. **NCCL 死锁：decode 请求的 CP size 未纳入 dycp_batch_cp_size**：
+   - 问题：`dycp_batch_cp_size` 初始化只包含 prefill 请求（过滤 `req.num_computed_tokens < req.num_prompt_tokens`），decode 被排除
+   - 根因：当 CP=4 decode 和 CP=2 decode 并发运行时，`actual_cp_size = max(4,2) = 4`，CP=2 ranks 使用 `get_dycp_subgroup(4)` 包含不参与 all-reduce 的空闲 rank → 死锁
+   - 修复：移除 prefill-only 过滤，`dycp_batch_cp_size` 包含所有 RUNNING CP>1 请求
+   - 验证：4x CP=4 并发、2x CP=4+2x CP=2 并发、2x CP=4+2x CP=1 并发、2x CP=2+2x CP=1 并发均通过
+
+**Decode Benchmark 结果**（DyCP + LocalPDConnector, CUDA graph, concurrency=4, 200 reqs, rate=4）：
+
+| 配置 | Input | Output | TTFT P50 | TTFT P90 | TPOT P50 | TPOT P90 | ITL P50 |
+|------|-------|--------|----------|----------|----------|----------|---------|
+| CP=1 | 4K | 50 | 510ms | 526ms | 7.92ms | 8.96ms | 7.86ms |
+| CP=2 | 8K | 50 | 754ms | 761ms | 8.01ms | 9.04ms | 7.95ms |
+| CP=4* | 16K | 50 | ~1400ms | - | ~8.1ms | - | ~8.0ms |
+
+*CP=4 benchmark 在最后一个请求卡住（199/200 和 49/50 均复现），这是 LocalPDConnector 的问题，非 NCCL 死锁。前 199 个请求的 TPOT 与 CP=1/CP=2 基本对齐。
+
+**TTFT 分析**：
+- CP=1 (4K): 510ms → per-rank 4K tokens
+- CP=2 (8K): 754ms → per-rank 4K tokens, 但有 NCCL all-gather 开销
+- CP=4 (16K): ~1400ms → per-rank 4K tokens, 但有更大的 NCCL all-gather 开销
+
+TTFT 随 CP size 增加是预期的：CP=2 的 all-gather 比 CP=1 多一次 4-rank 通信，CP=4 比 CP=2 多一次 8-rank 通信。
+
+**TPOT 分析**：
+- CP=1/CP=2/CP=4 的 TPOT P50 都在 8ms 左右，说明 decode 路径的 per-token 性能基本一致
+- 这符合预期：decode 每步只产生 1 token，CP 的 all-reduce 开销很小
+
+**新发现的 Bug**：
+- CP=4 + LocalPDConnector 的最后一个请求会卡住（Running: 1 reqs, 0 throughput, 0% KV cache）
+- CP=1 和 CP=2 不受影响
+- 需要调查 LocalPDConnector 在 CP=4 场景下的 prefill→decode 转换逻辑
+
+#### 待完成
+
+- 调查 CP=4 + LocalPDConnector 最后请求卡住的 bug
+- 运行 CP=8 (32K) benchmark
+- 运行混合 CP size benchmark（通过 `--use-local-json`）
+- MEDIUM 优先级问题修复（`has_slot_for_long_request` 缓存、`running_long_count` 变异风险）
 
 ### 2026-05-04 Session 31
 
