@@ -50,11 +50,26 @@
 
   **结论**：Worker 级 NCCL 死锁是由 `actual_cp_size` 计算错误和调度器级死锁的组合导致的。Session 28-29 的修复解决了这两个根因，Session 30 的审计和诊断日志帮助确认了 MLA 后端的正确性。
 
+**正式 Benchmark 结果**（CP=2, 8K input, 50 output, proxy, concurrency=4, 2000 requests）：
+
+  | 指标 | Session 28 | Session 31 | 变化 |
+  |------|-----------|-----------|------|
+  | 成功/失败 | 2000/0 | 2000/0 | - |
+  | TTFT P50 | 752.64ms | 755.60ms | +0.4% |
+  | TTFT P90 | 759.76ms | 763.24ms | +0.5% |
+  | TTFT P99 | 794.08ms | 780.99ms | -1.6% |
+  | TPOT P50 | 9.07ms | **7.81ms** | **-13.9%** |
+  | TPOT P90 | 10.05ms | **8.83ms** | **-12.1%** |
+  | TPOT P99 | 10.47ms | **9.12ms** | **-12.9%** |
+  | ITL P50 | 9.01ms | **7.76ms** | **-13.9%** |
+  | 总吞吐 | 27365 tok/s | 28786 tok/s | +5.2% |
+
+  TPOT 性能提升约 14%，ITL 提升 14%，总吞吐提升 5.2%。TTFT 基本持平。
+
 #### 待完成
 
 - **P0 已解决**：Worker 级 NCCL 死锁不再复现
-- 清理 Session 30 的 DYCP_NCCL 诊断日志（降级为 TRACE 或移除）
-- 混合 CP size 性能 benchmark（TTFT/TPOT 数据）
+- 混合 CP size 性能 benchmark（需 `--use-local-json` 构造不同长度请求）
 - MEDIUM 优先级问题修复（`has_slot_for_long_request` 缓存、`running_long_count` 变异风险）
 
 ### 2026-05-04 Session 30
