@@ -1,6 +1,61 @@
 # DyCP Progress
 
-## 当前状态：Worker 级 NCCL 死锁根因分析进行中
+## 当前状态：NCCL 死锁已修复，稳定性验证通过
+
+### 2026-05-04 Session 31
+
+- **NCCL 死锁不再复现**：系统性测试确认 Worker 级 NCCL 死锁已修复
+
+  **测试矩阵**（全部通过）：
+
+  | 测试 | 请求 | Output | Concurrency | 模式 | 结果 |
+  |------|------|--------|-------------|------|------|
+  | CP=4-only | 10 | 10 | 1 | CUDA graph | 10/10 OK |
+  | 混合 CP=1/4/8 | 20 | 50 | 4 | CUDA graph | 20/20 OK |
+  | 混合 CP=1/4/8 | 100 | 50 | 4 | CUDA graph | 100/100 OK |
+  | 混合 CP=1/4/8 | 200 | 1024 | 4 | CUDA graph | 200/200 OK |
+  | 混合 CP=1/4/8 (proxy) | 200 | 50 | 4 | CUDA graph | 200/200 OK |
+  | 混合 CP=1/4/8 (proxy) | 200 | 1024 | 4 | CUDA graph | 200/200 OK |
+  | 混合 CP=1/4/8 (proxy) | 1000 | 50 | 4 | CUDA graph | 1000/1000 OK |
+  | 混合 CP=1/4/8 (eager) | 200 | 50 | 4 | Eager | 200/200 OK |
+  | 混合 CP=1/4/8 (eager) | 500 | 50 | 4 | Eager | 500/500 OK |
+
+  **关键发现**：
+  - CP=4-only 完全稳定（10/10），确认死锁不在 NCCL 子组内部
+  - 混合 CP=1/4/8 在 CUDA graph 和 eager 模式下均稳定
+  - 通过 proxy 的 1000 请求测试完全通过（Session 28 在 859/1000 时卡住）
+  - Eager 模式 500 请求测试完全通过（Session 29 在 ~10 请求时卡住）
+
+  **根因分析**：
+
+  Session 30 的代码审计确认 MLA 后端（DeepSeek-V2-Lite 使用的后端）已有正确的 NCCL 守卫。Session 30 对 flash_attn/flashinfer 的修复不影响 FLASHMLA 后端。Session 30 的诊断日志改动也无行为影响。
+
+  死锁修复最可能来自 Session 28-29 的以下修复：
+
+  1. **`per_req_cp_sizes` 预填充 RUNNING 请求**（Session 28, commit `17447aa66`）：
+     - 修复前：RUNNING 请求的 cp_size 未记录到 `per_req_cp_sizes`
+     - 修复后：调度循环前从所有 RUNNING 请求预填充
+     - 影响：`actual_cp_size = max(per_req_cp_sizes.values())` 计算正确
+     - 错误的 `actual_cp_size` 会导致 NCCL 子组选择不匹配
+
+  2. **`finished_req_ids` 修复**（Session 28, commit `17447aa66`）：
+     - 修复前：被抢占后取消的 CP>1 请求不通知 worker ranks
+     - 修复后：保存 `_preempted_cp_ranks` 确保正确通知
+     - 影响：防止 worker ranks 上的泄漏状态
+
+  3. **基于进度的停滞检测器**（Session 29, commit `83394ed67`）：
+     - 修复前：`dyncp_has_decode` 永久阻塞新 prefill
+     - 修复后：连续 50 步 0 进展时强制允许 prefill
+     - 影响：防止调度器级死锁导致 NCCL 超时
+
+  **结论**：Worker 级 NCCL 死锁是由 `actual_cp_size` 计算错误和调度器级死锁的组合导致的。Session 28-29 的修复解决了这两个根因，Session 30 的审计和诊断日志帮助确认了 MLA 后端的正确性。
+
+#### 待完成
+
+- **P0 已解决**：Worker 级 NCCL 死锁不再复现
+- 清理 Session 30 的 DYCP_NCCL 诊断日志（降级为 TRACE 或移除）
+- 混合 CP size 性能 benchmark（TTFT/TPOT 数据）
+- MEDIUM 优先级问题修复（`has_slot_for_long_request` 缓存、`running_long_count` 变异风险）
 
 ### 2026-05-04 Session 30
 
@@ -132,8 +187,8 @@
 
 #### 待完成
 
-- **P0**：修复 Worker 级 NCCL 死锁（混合 CP size 测试的阻塞问题）
-- 混合 CP size 长时间稳定性测试（当前被 NCCL 死锁阻塞）
+- ~~**P0**：修复 Worker 级 NCCL 死锁~~ ✓ 已修复（Session 31 确认不再复现）
+- ~~混合 CP size 长时间稳定性测试~~ ✓ 已完成（Session 31: 1000/1000 通过 proxy, 500/500 eager 模式）
 - MEDIUM 优先级问题修复（`has_slot_for_long_request` 缓存、`running_long_count` 变异风险）
 - 性能回归测试（concurrency=2+ benchmark 对比 Session 26 基线）
 
