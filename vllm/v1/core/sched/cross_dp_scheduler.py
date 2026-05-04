@@ -730,21 +730,17 @@ class CrossDPScheduler(Scheduler):
         # would cause the wrong NCCL subgroup to be used for some requests.
         # This constraint matches the design doc: "优先实现一个batch里面
         # 只会有一个size的CP".
-        # Initialize from RUNNING CP>1 prefill requests only.
-        # Decode requests are excluded because: (1) dync_has_decode
-        # already blocks all prefills when any decode is running, so
-        # dycp_batch_cp_size from decode never independently blocks
-        # prefills; (2) decode uses per-request per_req_cp_sizes for
-        # CUDA graph selection, not batch-level actual_cp_size for
-        # NCCL subgroup; (3) including decode would prevent different
-        # CP-size prefills from being scheduled after decode finishes,
-        # even though the NCCL constraint no longer applies.
+        # Initialize from ALL RUNNING CP>1 requests (both prefill and decode).
+        # Decode must be included because the NCCL all-reduce in the decode
+        # path uses actual_cp_size for subgroup selection. If CP=4 decode
+        # and CP=2 decode run in the same batch, actual_cp_size=max(4,2)=4,
+        # causing CP=2 ranks to use get_dycp_subgroup(4) which includes
+        # idle ranks that don't participate in the all-reduce → deadlock.
         dycp_batch_cp_size: int = 0
         if self.dycp_enabled:
             running_cp_sizes = {
                 len(req.cp_ranks) for req in self.running
                 if len(req.cp_ranks) > 1
-                and req.num_computed_tokens < req.num_prompt_tokens
             }
             if running_cp_sizes:
                 dycp_batch_cp_size = max(running_cp_sizes)
