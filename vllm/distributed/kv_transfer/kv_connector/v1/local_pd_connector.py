@@ -720,16 +720,16 @@ class LocalPDConnector(KVConnectorBase_V1):
                     "(no decode request after %.0fs), freeing blocks",
                     k, self._orphan_timeout_s,
                 )
-                meta = self._completed_prefills.pop(k, None)
+                orphan_meta = self._completed_prefills.pop(k, None)
                 prefill_req_id = self._ipc_delayed_prefill_ids.pop(k, None)
                 # Schedule the prefill request's blocks for freeing.
                 # The scheduler will pick this up via get_finished() and
                 # call _free_blocks() to release the KV cache blocks.
                 if prefill_req_id:
                     self._orphaned_prefill_ids_to_free.add(prefill_req_id)
-                elif meta and meta.get("prefill_req_id"):
+                elif orphan_meta and orphan_meta.get("prefill_req_id"):
                     self._orphaned_prefill_ids_to_free.add(
-                        meta["prefill_req_id"])
+                        orphan_meta["prefill_req_id"])
 
         # Only remove requests that were actually processed this step.
         # Unconditionally clearing loses registrations for requests that
