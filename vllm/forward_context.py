@@ -47,9 +47,10 @@ class BatchDescriptor(NamedTuple):
     Whether this batch has active LoRA adapters.
     """
 
-    num_cp_tokens: int = 0
+    num_cp_request: int = 0
     """
-    For cp tokens
+    Number of CP (Context Parallel) requests in the batch.
+    Used as 2nd dimension of DyCP CUDA graph key: (num_tokens, num_cp_request, cp_size).
     """
 
     cp_size: int = 1

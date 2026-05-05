@@ -1816,6 +1816,7 @@ class GPUModelRunner(
         num_dycp_reqs: int = 0,
         num_dycp_tokens: int = 0,
         actual_cp_size: int = 1,
+        dycp_has_prefill: bool | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -1991,8 +1992,15 @@ class GPUModelRunner(
             # pcp_allgather_restore_idx is only needed when PCP token
             # splitting was used (DyCP prefill). Pure decode has
             # num_dycp_tokens == num_dycp_reqs (1 token per request).
-            _dycp_has_prefill = num_dycp_tokens > num_dycp_reqs
-            if num_dycp_tokens > 0 and _dycp_has_prefill:
+            # Use pre-split dycp_has_prefill (from prepare_inputs,
+            # computed before update_tokens_for_pcp) when available,
+            # otherwise fall back to post-split token count comparison.
+            _has_prefill = (
+                dycp_has_prefill
+                if dycp_has_prefill is not None
+                else num_dycp_tokens > num_dycp_reqs
+            )
+            if num_dycp_tokens > 0 and _has_prefill:
                 dycp_allgather_size = num_dycp_tokens * actual_cp_size
                 cm_base.pcp_allgather_restore_idx = self.pcp_manager.pcp_allgather_restore_idx.gpu[
                     :dycp_allgather_size
@@ -2017,7 +2025,7 @@ class GPUModelRunner(
             # DualChunkSwap and interleave positions. After KV allgather, each
             # rank has full KV data — this slot_mapping writes ALL interleave-
             # assigned positions to paged cache so decode can read them via IPC.
-            if _dycp_has_prefill and actual_cp_size > 1:
+            if _has_prefill and actual_cp_size > 1:
                 qsl_cpu = self.query_start_loc.cpu[:num_dycp_reqs + 1]
                 local_tokens_np = (
                     qsl_cpu[1:num_dycp_reqs + 1] - qsl_cpu[:num_dycp_reqs]
@@ -3237,7 +3245,7 @@ class GPUModelRunner(
         force_uniform_decode: bool | None = None,
         force_has_lora: bool | None = None,
         num_encoder_reqs: int = 0,
-        num_cp_tokens: int = 0,
+        num_cp_request: int = 0,
         actual_cp_size: int = 1,
     ) -> tuple[
         CUDAGraphMode,
@@ -3273,8 +3281,8 @@ class GPUModelRunner(
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
                 disable_full=disable_full,
-                num_cp_tokens=num_cp_tokens,
-                cp_size=actual_cp_size if num_cp_tokens > 0 else 1,
+                num_cp_request=num_cp_request,
+                cp_size=actual_cp_size if num_cp_request > 0 else 1,
             )
             if not force_eager
             else (CUDAGraphMode.NONE, BatchDescriptor(num_tokens_padded))
@@ -3366,11 +3374,11 @@ class GPUModelRunner(
                     logger.debug(
                         "DyCP dispatch: dp_rank=%d, cudagraph_mode=%s, "
                         "num_tokens=%d, num_tokens_padded=%d, "
-                        "num_cp_tokens=%d, actual_cp_size=%d, "
+                        "num_cp_request=%d, actual_cp_size=%d, "
                         "disable_full=%s, uniform_decode=%s",
                         self.parallel_config.data_parallel_rank,
                         cudagraph_mode, num_tokens, num_tokens_padded,
-                        num_cp_tokens, actual_cp_size,
+                        num_cp_request, actual_cp_size,
                         disable_full, uniform_decode,
                     )
 
@@ -3553,7 +3561,7 @@ class GPUModelRunner(
                     max_num_scheduled_tokens=max_num_scheduled_tokens,
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
-                    num_cp_tokens=scheduler_output.num_cp_request,
+                    num_cp_request=scheduler_output.num_cp_request,
                     actual_cp_size=scheduler_output.actual_cp_size,
                 )
 
@@ -3582,12 +3590,18 @@ class GPUModelRunner(
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
-                # Calculate num_dycp_tokens
+                # Calculate num_dycp_tokens and dycp_has_prefill
                 if scheduler_output.num_cp_request > 0:
                     num_dycp_reqs = scheduler_output.num_cp_request
                     num_dycp_tokens = int(num_scheduled_tokens_np[:num_dycp_reqs].sum())
+                    # Compute before PCP split to avoid misclassifying
+                    # prefill as decode when each rank has exactly 1 token.
+                    dycp_has_prefill = np.any(
+                        num_scheduled_tokens_np[:num_dycp_reqs] > 1
+                    )
                 else:
                     num_dycp_tokens = 0
+                    dycp_has_prefill = False
 
                 (attn_metadata, spec_decode_common_attn_metadata) = (
                     self._build_attention_metadata(
@@ -3604,6 +3618,7 @@ class GPUModelRunner(
                         num_dycp_reqs=scheduler_output.num_cp_request,
                         num_dycp_tokens=num_dycp_tokens,
                         actual_cp_size=scheduler_output.actual_cp_size,
+                        dycp_has_prefill=dycp_has_prefill,
                     )
                 )
 
@@ -4576,7 +4591,7 @@ class GPUModelRunner(
         remove_lora: bool = True,
         activate_lora: bool = False,
         is_graph_capturing: bool = False,
-        num_cp_tokens: int = 0,
+        num_cp_request: int = 0,
         actual_cp_size: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -4677,7 +4692,7 @@ class GPUModelRunner(
                 # activated later in the context manager, but we need to know the
                 # LoRA state when determining the batch descriptor for capture
                 force_has_lora=activate_lora,
-                num_cp_tokens=num_cp_tokens,
+                num_cp_request=num_cp_request,
                 actual_cp_size=actual_cp_size,
             )
         )
@@ -4725,7 +4740,7 @@ class GPUModelRunner(
                 max_query_len=max_query_len,
                 ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                 for_cudagraph_capture=is_graph_capturing,
-                num_dycp_reqs=num_cp_tokens,
+                num_dycp_reqs=num_cp_request,
                 num_dycp_tokens=0,  # CUDA graph capture uses dummy values
                 actual_cp_size=actual_cp_size,
             )
@@ -5270,7 +5285,7 @@ class GPUModelRunner(
             )
 
         # We skip EPLB here since we don't want to record dummy metrics
-        for num_tokens, activate_lora, num_cp_tokens, cp_size in compilation_cases:
+        for num_tokens, activate_lora, num_cp_request, cp_size in compilation_cases:
             # We currently only capture ubatched graphs when its a FULL
             # cudagraph, a uniform decode batch, and the number of tokens
             # is above the threshold. Otherwise we just capture a non-ubatched
@@ -5302,7 +5317,7 @@ class GPUModelRunner(
                     skip_eplb=True,
                     remove_lora=False,
                     activate_lora=activate_lora,
-                    num_cp_tokens=num_cp_tokens,
+                    num_cp_request=num_cp_request,
                     actual_cp_size=cp_size,
                 )
             self._dummy_run(
@@ -5314,7 +5329,7 @@ class GPUModelRunner(
                 remove_lora=False,
                 activate_lora=activate_lora,
                 is_graph_capturing=True,
-                num_cp_tokens=num_cp_tokens,
+                num_cp_request=num_cp_request,
                 actual_cp_size=cp_size,
             )
         self.maybe_remove_all_loras(self.lora_config)

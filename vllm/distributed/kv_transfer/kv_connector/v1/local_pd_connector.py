@@ -275,6 +275,7 @@ class LocalPDConnector(KVConnectorBase_V1):
             self._ipc_stream = None  # dedicated CUDA stream for async IPC
             # {decode_req_id: (cuda_event, prefill_req_id)} async IPC tracking
             self._ipc_pending_events: dict[str, tuple] = {}
+            self._ipc_gpu_synced: bool = False
 
         logger.info(
             "LocalPDConnector initialized: storage_path=%s, "
@@ -957,6 +958,7 @@ class LocalPDConnector(KVConnectorBase_V1):
         if not per_rank_block_ids:
             logger.error("No per_rank_block_ids for prefix=%s", prefix)
             return
+        cp_world_size = meta.get("cp_world_size", self._cp_world_size)
         if len(per_rank_block_ids) < cp_world_size:
             logger.error(
                 "per_rank_block_ids length %d < cp_world_size %d "
@@ -964,8 +966,6 @@ class LocalPDConnector(KVConnectorBase_V1):
                 len(per_rank_block_ids), cp_world_size, prefix,
             )
             return
-
-        cp_world_size = meta.get("cp_world_size", self._cp_world_size)
         block_size = self._block_size
         interleave_size = meta.get("interleave_size", self._interleave_size)
 
@@ -1268,7 +1268,7 @@ class LocalPDConnector(KVConnectorBase_V1):
         """
         if not self._ipc_pending_events:
             return
-        if getattr(self, '_ipc_gpu_synced', False):
+        if self._ipc_gpu_synced:
             return
         # On first call, insert GPU-level wait for ALL pending IPC events.
         # After this, default stream won't execute until IPC stream finishes.
@@ -1367,6 +1367,7 @@ class LocalPDConnector(KVConnectorBase_V1):
         if self._cuda_lib and self._ipc_pending_events:
             event_query_fn = self._cuda_lib.funcs["cudaEventQuery"]
             completed: list[str] = []
+            errored: list[str] = []
             for decode_req_id, (event, prefill_req_id) in (
                 self._ipc_pending_events.items()
             ):
@@ -1375,7 +1376,16 @@ class LocalPDConnector(KVConnectorBase_V1):
                     completed.append(decode_req_id)
                     if prefill_req_id:
                         finished_sending.add(prefill_req_id)
-            for did in completed:
+                elif result != 600:  # not cudaErrorNotReady → CUDA error
+                    errored.append(decode_req_id)
+                    logger.error(
+                        "cudaEventQuery returned %d for decode_req=%s, "
+                        "forcing cleanup (prefill blocks will be freed)",
+                        result, decode_req_id,
+                    )
+                    if prefill_req_id:
+                        finished_sending.add(prefill_req_id)
+            for did in completed + errored:
                 event_ptr, _ = self._ipc_pending_events.pop(did)
                 # Destroy CUDA event to prevent resource leak.
                 try:
