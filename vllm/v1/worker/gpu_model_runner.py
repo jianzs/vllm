@@ -3508,6 +3508,19 @@ class GPUModelRunner(
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+                # Compute dycp_has_prefill BEFORE _prepare_inputs, which
+                # may modify num_scheduled_tokens_np via PCP token splitting.
+                # After splitting, each rank may have only 1 token per
+                # prefill request, causing the >1 check to misclassify
+                # prefill as decode.
+                if (self.dycp_world_size > 1
+                        and scheduler_output.num_cp_request > 0):
+                    dycp_has_prefill_pre_split = np.any(
+                        num_scheduled_tokens_np[
+                            :scheduler_output.num_cp_request] > 1
+                    )
+                else:
+                    dycp_has_prefill_pre_split = False
 
                 (
                     logits_indices,
@@ -3590,15 +3603,15 @@ class GPUModelRunner(
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
-                # Calculate num_dycp_tokens and dycp_has_prefill
+                # Calculate num_dycp_tokens and dycp_has_prefill.
+                # Use the pre-split dycp_has_prefill computed before
+                # _prepare_inputs, since PCP splitting may reduce token
+                # counts to 1 per request, causing post-split >1 check
+                # to misclassify prefill as decode.
                 if scheduler_output.num_cp_request > 0:
                     num_dycp_reqs = scheduler_output.num_cp_request
                     num_dycp_tokens = int(num_scheduled_tokens_np[:num_dycp_reqs].sum())
-                    # Compute before PCP split to avoid misclassifying
-                    # prefill as decode when each rank has exactly 1 token.
-                    dycp_has_prefill = np.any(
-                        num_scheduled_tokens_np[:num_dycp_reqs] > 1
-                    )
+                    dycp_has_prefill = dycp_has_prefill_pre_split
                 else:
                     num_dycp_tokens = 0
                     dycp_has_prefill = False
@@ -3687,9 +3700,9 @@ class GPUModelRunner(
                 # Only restore hidden states when PCP token splitting was used
                 # (i.e., DyCP prefill). Pure DyCP decode skips PCP processing
                 # entirely, so no allgather/restore is needed.
-                dycp_has_prefill = np.any(
-                    num_scheduled_tokens_np[:scheduler_output.num_cp_request] > 1
-                )
+                # Use pre-split value to avoid misclassifying prefill as
+                # decode after PCP splitting reduces token counts to 1.
+                dycp_has_prefill = dycp_has_prefill_pre_split
                 if dycp_has_prefill:
                     num_cp_request = scheduler_output.num_cp_request
                     num_dycp_tokens_unpadded = int(num_scheduled_tokens_np[:num_cp_request].sum())

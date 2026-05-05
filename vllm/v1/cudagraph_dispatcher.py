@@ -205,8 +205,12 @@ class CudagraphDispatcher:
                     return CUDAGraphMode.FULL, relaxed_batch_desc
 
         # also check if the relaxed key exists for more "general"
-        # piecewise cudagraph
-        if relaxed_batch_desc in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]:
+        # piecewise cudagraph. Skip when cp_size > 1 for the same
+        # reason as FULL: the relaxed key drops cp_size, which would
+        # replay a graph captured with the wrong NCCL subgroup.
+        if (cp_size <= 1
+                and relaxed_batch_desc in self.cudagraph_keys[
+                    CUDAGraphMode.PIECEWISE]):
             return CUDAGraphMode.PIECEWISE, relaxed_batch_desc
 
         # finally, just return no cudagraphs and a trivial batch descriptor
