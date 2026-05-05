@@ -167,6 +167,10 @@ class RequestManager:
 
         for rank in request.cp_ranks:
             self.num_req_per_dp[rank] -= 1
+            assert self.num_req_per_dp[rank] >= 0, (
+                f"num_req_per_dp[{rank}] went negative: "
+                f"{self.num_req_per_dp[rank]}"
+            )
 
     def get_num_req_per_dp(self, dp_rank: int) -> int:
         return self.num_req_per_dp[dp_rank]
@@ -1106,7 +1110,13 @@ class CrossDPScheduler(Scheduler):
                     cp_size=req_cp_size if self.dycp_enabled else 0,
                 )
                 if selected_dp is None:
-                    break
+                    # No aligned subgroup available for this CP>1
+                    # request. Skip it and try the next request (which
+                    # may be CP=1 and fit on an available rank) rather
+                    # than breaking the entire waiting loop.
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
                 
                 if len(selected_dp) > 1:
                     logger.debug("CP req: selected_dp=%s, request_id=%s", selected_dp, request.request_id)

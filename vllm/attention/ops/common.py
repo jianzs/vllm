@@ -293,7 +293,15 @@ def dycp_lse_out_ar(
     # FlashMLA returns lse as [B, H, S]; squeeze to [B, H] for decode (S=1)
     if cp_attn_lse.ndim == 3 and cp_attn_lse.shape[-1] == 1:
         cp_attn_lse = cp_attn_lse.squeeze(-1)
-    lse_exp = torch.exp(cp_attn_lse)[:num_dycp_reqs]
+    lse_slice = cp_attn_lse[:num_dycp_reqs]
+    # Replace NaN and +inf with -inf so exp() yields 0 (no contribution)
+    # instead of propagating invalid values through the all-reduce.
+    lse_slice = torch.where(
+        torch.isnan(lse_slice) | torch.isinf(lse_slice),
+        torch.full_like(lse_slice, float('-inf')),
+        lse_slice,
+    )
+    lse_exp = torch.exp(lse_slice)
     lse_exp_unsqueezed = lse_exp.unsqueeze(-1)
     weighted_output = cp_attn_out[:num_dycp_reqs] * lse_exp_unsqueezed
     target_shape = weighted_output.view(lse_exp.shape[0], -1).shape
@@ -304,7 +312,12 @@ def dycp_lse_out_ar(
     cp_group.all_reduce(packed_out)
     global_weighted = packed_out[:, :target_shape[1]].view(weighted_output.shape)
     global_lse_sum = packed_out[:, target_shape[1]:].view(lse_exp_unsqueezed.shape)
-    global_output = global_weighted / global_lse_sum
+    # Guard against division by zero when all LSE values are -inf
+    global_output = torch.where(
+        global_lse_sum > 0,
+        global_weighted / global_lse_sum,
+        torch.zeros_like(global_weighted),
+    )
     cp_attn_out[:num_dycp_reqs].copy_(global_output)
 
     return cp_attn_out

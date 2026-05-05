@@ -3333,10 +3333,11 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                             scale=layer._k_scale,
                         )
                     else:
-                        logger.error(
-                            "dycp second cache write SKIPPED: "
-                            "max_slot=%d >= kv_slots=%d",
-                            max_slot, kv_slots,
+                        assert False, (
+                            f"dycp second cache write: max_slot={max_slot} "
+                            f">= kv_slots={kv_slots}. Slot mapping "
+                            f"out-of-bounds indicates a bug in block "
+                            f"allocation or interleave calculation."
                         )
 
 

@@ -708,7 +708,7 @@ class LocalPDConnector(KVConnectorBase_V1):
         # Cleanup orphaned _completed_prefills entries whose decode
         # partner never arrived. Safe to remove because decode requests
         # carry their own metadata via kv_transfer_params fallback.
-        if cp_rank == 0 and self._completed_prefills:
+        if cp_rank == 0 and (self._completed_prefills or self._prefill_requests):
             now_ms = _time.monotonic() * 1000
             orphaned = [
                 k for k, v in self._completed_prefills.items()
