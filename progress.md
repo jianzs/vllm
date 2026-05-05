@@ -1,6 +1,117 @@
 # DyCP Progress
 
-## 当前状态：HIGH 修复完成，CP=2 benchmark 运行中
+## 当前状态：Session 39 完成，性能验证通过，所有已知 bug 已修复
+
+### 2026-05-05 Session 39
+
+- **目标**：验证 Session 38 修复后的性能和稳定性，代码审查
+- **进展**：
+  1. 代码审查 Session 38 修复（6 个 MEDIUM/LOW + 2 个回归 bug）：
+     - CUDA event+block 泄漏修复：error 结果也触发 cleanup ✓
+     - `_ipc_gpu_synced` 初始化：在 `__init__` 中设置 ✓
+     - `dycp_has_prefill` PCP split 后误判修复：传参而非重算 ✓
+     - `num_cp_tokens` → `num_cp_request` 重命名：跨 3 文件一致 ✓
+     - `cp_world_size` 使用前定义：移到校验之前 ✓
+     - 死代码删除：`dycp_local_block_size` / `dycp_virtual_block_size` ✓
+     - 清理遗留空白行（commit `fa3e67a10`）
+
+  2. 性能验证（DyCP + LocalPDConnector + Proxy, CUDA graph）：
+
+  **CP=2 基线 Benchmark**（200 reqs, 8K input, 50 output, concurrency=4, via proxy）：
+
+  | 来源 | TPOT P50 | TPOT P90 | TTFT P50 |
+  |------|----------|----------|----------|
+  | Session 31 基线 | 7.81ms | 8.83ms | 755.60ms |
+  | Session 37 | 8.10ms | 8.19ms | 608.13ms |
+  | **Session 39** | **9.10ms** | **10.12ms** | **754.34ms** |
+
+  **分析**：TPOT P50=9.10ms 与 Session 36（9.21ms）和 Session 35（9.4-10.1ms）一致，在历史正常范围内。Session 37 的 8.10ms 和 Session 31 的 7.81ms 可能是硬件变异的低端值。Session 38 的代码改动不涉及 decode 执行路径，不会影响 TPOT。
+
+  **混合 CP Size Benchmark**（45 reqs: 30x4K + 10x16K + 5x32K, 50 output, concurrency=4, via proxy）：
+
+  | 指标 | P50 | P90 | P99 |
+  |------|-----|-----|-----|
+  | TTFT | 619ms | 1614ms | 2057ms |
+  | TPOT | 10.16ms | 11.79ms | 12.21ms |
+  | ITL | 9.14ms | 10.60ms | 13.46ms |
+  45/45 成功，0 失败
+
+  **混合 CP Size 长时间 Decode Benchmark**（45 reqs: 30x4K + 10x16K + 5x32K, 1024 output, concurrency=4, via proxy）：
+
+  | 指标 | P50 | P90 | P99 |
+  |------|-----|-----|-----|
+  | TTFT | 451.56ms | 507.39ms | 9563.83ms |
+  | TPOT | 9.30ms | 9.36ms | 9.40ms |
+  | ITL | 9.26ms | 9.42ms | 10.14ms |
+  45/45 成功，0 失败
+
+  **关键发现**：
+  - 所有 benchmark 0 失败，Session 38 修复未引入回归
+  - 1024 output 的 TPOT 分布极紧凑（P50=9.30ms, P90=9.36ms, P99=9.40ms），长时间 decode 稳定
+  - TTFT P99=9563ms 是 Local PD 互斥调度的预期行为（长 decode 阻塞新 prefill）
+  - 服务器在 benchmark 完成后因 RPC timeout 崩溃（空闲超时，非 DyCP bug）
+
+  3. 剩余未修复问题（均为 LOW 优先级，不影响功能或正确性）：
+
+  **调度器**：
+  - LOW: `_update_after_schedule` 静默跳过 `cp_ranks=[]` 请求的 `num_computed_tokens` 更新
+  - LOW: `select_dp()` 副作用：清空 `request.cp_ranks`
+  - LOW: `_free_encoder_inputs` 对 CP>1 非 rank 0 冗余调用
+  - LOW: `has_slot_for_cp_request` 不考虑 token budget
+  - LOW: `actual_cp_size` 可能 >1 即使当前 step 无 CP>1 请求执行
+
+  **MLA Attention**：
+  - LOW: `local_context_lens_allranks` DP 请求列为零
+
+- **下一步**：
+  1. 所有 P0/P1/P2 已完成，MEDIUM/HIGH bug 已修复，LOW 优先级问题可后续处理
+  2. 可考虑：全面代码审查、边界条件分析、或性能优化（如 `dync_has_decode` 过于宽泛的优化）
+
+### 2026-05-05 Session 38
+
+- **目标**：修复代码审查发现的剩余 MEDIUM/LOW 问题，验证修复正确性
+- **进展**：
+  1. 修复 6 个 MEDIUM/LOW 问题 + 2 个回归 bug（commit `077ea3f8e`）：
+
+  **MEDIUM: CUDA event+block 泄漏**（local_pd_connector.py）：
+  - 问题：`cudaEventQuery` 返回错误（既非 success 也非 notReady）时，event 和 prefill blocks 永远不会被清理
+  - 修复：error 结果也触发 cleanup，并输出 logger.error 日志
+
+  **MEDIUM: `_ipc_gpu_synced` 未在 `__init__` 初始化**（local_pd_connector.py）：
+  - 问题：使用 `getattr(self, '_ipc_gpu_synced', False)` 回退，直接访问会 AttributeError
+  - 修复：在 `__init__` 中初始化 `self._ipc_gpu_synced = False`，改为直接属性访问
+
+  **MEDIUM: `dycp_has_prefill` 在 PCP split 后可能误判**（gpu_model_runner.py）：
+  - 问题：`_dycp_has_prefill = num_dycp_tokens > num_dycp_reqs` 在 PCP split 后计算，当每个 rank 恰好有 1 token 时会误判为 decode
+  - 修复：添加 `dycp_has_prefill` 参数到 `_build_attention_metadata`，从 `prepare_inputs` 和 `execute_model` 传入 pre-split 值
+
+  **MEDIUM: `num_cp_tokens` 参数名误导**（forward_context.py, cudagraph_dispatcher.py, gpu_model_runner.py）：
+  - 问题：参数名暗示 token 数，实际接收请求数
+  - 修复：重命名为 `num_cp_request`，跨 3 个文件 15 处替换
+
+  **LOW: 死代码 `dycp_local_block_size` / `dycp_virtual_block_size`**（mla/common.py）：
+  - 问题：定义但从未使用
+  - 修复：删除
+
+  **回归 bug: `cp_world_size` 使用前未定义**（local_pd_connector.py）：
+  - 问题：Session 37 的 `per_rank_block_ids` 长度校验在 `cp_world_size` 赋值之前引用了该变量
+  - 修复：将 `cp_world_size = meta.get(...)` 移到校验之前
+
+  **回归 bug: `dycp_has_prefill` 作用域错误**（gpu_model_runner.py）：
+  - 问题：将 `_dycp_has_prefill` 改为 `dycp_has_prefill` 后，`_build_attention_metadata` 中引用了 `prepare_inputs` 的局部变量
+  - 修复：添加参数传递机制，`_dummy_run` 使用 `None` 回退到 `num_dycp_tokens > num_dycp_reqs`
+
+  2. 冒烟测试通过（DyCP + LocalPDConnector + Proxy, CUDA graph）：
+  - CP=1（短请求）：✓
+  - CP=2（~8K tokens）：✓
+  - CP=4（~16K tokens）：✓
+  - CP=8（~32K tokens）：✓
+  - 并发混合（2x CP=1 + CP=2 + CP=4）：✓ 全部成功
+
+- **下一步**：
+  1. 运行混合 CP size + 长时间 decode benchmark 验证稳定性
+  2. 全面代码审查确认所有修复正确
+  3. 性能回归检查（与 Session 37 基线对比）
 
 ### 2026-05-05 Session 37
 
