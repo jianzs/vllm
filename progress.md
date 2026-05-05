@@ -1,6 +1,67 @@
 # DyCP Progress
 
-## 当前状态：Session 41 完成，系统性性能基准测试，所有 CP size 单独和混合 workload 通过
+## 当前状态：Session 42 完成，DP Baseline 对比测试，DyCP Prefill 加速显著
+
+### 2026-05-06 Session 42
+
+- **目标**：DP baseline 对比测试，量化 DyCP CP 并行的加速效果
+- **配置**：DeepSeek-V2-Lite, DP=8, TP=1, dp_per_domain=8, CUDA graph
+  - DP Baseline: 无 cp-size-thresholds, 无 KV transfer (prefill) / CrossDPExampleConnector (decode)
+  - DyCP (Session 41): cp-size-thresholds=[(4096,1),(16384,4),(32768,8)], LocalPDConnector + Proxy
+  - max-num-batched-tokens=4096, gpu-memory-utilization=0.70, FLASHMLA backend
+
+- **进展**：
+
+  1. DP Baseline Prefill 性能（直接打 vllm:8400，output=1，无 CP）：
+
+  | Input | TTFT P50 | TTFT P90 | 成功率 |
+  |-------|----------|----------|--------|
+  | 4K    | 397ms    | 514ms    | 200/200 |
+  | 8K    | 669ms    | 785ms    | 200/200 |
+  | 16K   | 1196ms   | 1275ms   | 200/200 |
+  | 32K   | 2974ms   | 4210ms   | 200/200 |
+
+  2. DP Baseline Decode 性能（CrossDPExampleConnector, vllm:8400, output=1024）：
+
+  | Input | TPOT P50 | TPOT P90 | TTFT P50 | 成功率 |
+  |-------|----------|----------|----------|--------|
+  | 4K    | 9.44ms   | 9.69ms   | 42.79ms  | 200/200 |
+  | 8K    | 9.80ms   | 10.12ms  | 63.25ms  | 200/200 |
+
+  3. DyCP vs DP Baseline Prefill 对比（同一 vllm:8400 直连）：
+
+  | 场景 | Input | CP Size | TTFT P50 | 对比 DP Baseline | 加速比 |
+  |------|-------|---------|----------|-----------------|--------|
+  | DP Baseline | 8K    | -       | 669ms    | -               | 1.00x  |
+  | DyCP         | 8K    | 1       | 718ms    | +7.3%           | 0.93x  |
+  | DP Baseline | 16K   | -       | 1196ms   | -               | 1.00x  |
+  | DyCP         | 16K   | 4       | 557ms    | -53.4%          | 2.15x  |
+  | DP Baseline | 32K   | -       | 2974ms   | -               | 1.00x  |
+  | DyCP         | 32K   | 8       | 792ms    | -73.4%          | 3.75x  |
+
+  **关键发现**：
+  - **CP=1 开销**：DyCP 8K/CP=1 比 DP 8K 慢 7.3%（718ms vs 669ms），这是 DyCP 调度框架的固有开销
+  - **CP=4 加速**：DyCP 16K/CP=4 比同等输入的 DP 16K 快 2.15x（557ms vs 1196ms），CP 并行效果显著
+  - **CP=8 加速**：DyCP 32K/CP=8 比同等输入的 DP 32K 快 3.75x（792ms vs 2974ms），CP 并行效果极显著
+  - **每 rank 等价性**：DyCP 16K/CP=4 (557ms) vs DP 4K (397ms)：DyCP 慢 40%，因为 CP allgather 通信开销
+  - **每 rank 等价性**：DyCP 32K/CP=8 (792ms) vs DP 4K (397ms)：DyCP 慢 99%，因为 CP allgather 通信开销随 CP size 增大
+
+  4. DyCP vs DP Baseline Decode 对比（注意：测试路径不同）：
+
+  | 场景 | Input | CP Size | TPOT P50 | 对比 |
+  |------|-------|---------|----------|------|
+  | DP Baseline (CrossDP) | 8K | - | 9.80ms | - |
+  | DyCP (PD Proxy)       | 8K | 1 | 7.94ms | -19% (更优) |
+  | DyCP (PD Proxy)       | 16K | 4 | 9.35ms | -4.6% |
+  | DyCP (PD Proxy)       | 32K | 8 | 9.59ms | -2.1% |
+
+  **注意**：DP Baseline decode 使用 CrossDPExampleConnector（直连 vllm:8400），DyCP decode 使用 LocalPDConnector + Proxy（proxy:9000），路径不同，不能直接对比。DP Baseline 的 TTFT 极低（42-63ms）因为 CrossDPExampleConnector 跳过了真正的 prefill。
+
+  - **下一步**：
+  1. 使用相同 PD 路径（LocalPDConnector + Proxy）重新跑 DP baseline decode，确保公平对比
+  2. 分析 CP=1 的 7.3% TTFT 开销来源（DyCP 调度开销 vs CP 框架开销）
+  3. 优化 CP>1 prefill 的 allgather 通信开销（当前 CP=8 比 DP 4K 慢 99%）
+  4. 考虑添加 DP baseline prefill 对比到设计文档的测试标准中
 
 ### 2026-05-06 Session 41
 
