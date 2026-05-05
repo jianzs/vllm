@@ -1635,6 +1635,16 @@ def destroy_model_parallel():
         _EP.destroy()
     _EP = None
 
+    global _DYCP
+    if _DYCP:
+        _DYCP.destroy()
+    _DYCP = None
+
+    global _DYCP_SUBGROUPS
+    for subgroup in _DYCP_SUBGROUPS.values():
+        subgroup.destroy()
+    _DYCP_SUBGROUPS = {}
+
 
 def destroy_distributed_environment():
     global _WORLD, _NODE_COUNT

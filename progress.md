@@ -1,6 +1,54 @@
 # DyCP Progress
 
-## 当前状态：Session 39 完成，代码审查修复 2 个 bug，性能验证通过
+## 当前状态：Session 40 完成，全面代码审查修复 3 个 bug，冒烟测试通过
+
+### 2026-05-05 Session 40
+
+- **目标**：全面代码审查和边界条件分析
+- **进展**：
+  1. 系统性代码审查（3 个并行审查 agent），覆盖调度器、注意力后端、CUDA graph、block table、并行状态
+
+  2. 修复 3 个 bug：
+
+  **HIGH: `destroy_model_parallel()` 未清理 `_DYCP` 和 `_DYCP_SUBGROUPS`**（parallel_state.py）：
+  - 问题：`destroy_model_parallel()` 清理了 `_TP/_DCP/_PCP/_PP/_DP/_EP` 但遗漏了 `_DYCP` 和 `_DYCP_SUBGROUPS`。NCCL process group 资源泄漏，重新初始化时可能导致 `AssertionError` 或使用已销毁的 NCCL communicator
+  - 修复：添加 `_DYCP.destroy()` 和遍历 `_DYCP_SUBGROUPS` 调用 `subgroup.destroy()`
+
+  **HIGH: `reset_prefix_cache` 绕过 DyCP 状态清理**（cross_dp_scheduler.py）：
+  - 问题：基类 `Scheduler.reset_prefix_cache(reset_running_requests=True)` 调用 `_preempt_request` 抢占所有运行请求，但不执行 DyCP 特定清理（`request_manager.free_req`、`_active_req_ids.discard`、保存 `_preempted_cp_ranks`、清除 `cp_ranks`）。导致 `num_req_per_dp` 双重递增、`_active_req_ids` 不一致、`cp_ranks` 过期
+  - 修复：在 `CrossDPScheduler` 中重写 `reset_prefix_cache`，执行与正常抢占路径相同的 DyCP 清理
+
+  **MEDIUM: `block_table.py` 过宽 `except Exception` 导致 block 分配不足**（block_table.py）：
+  - 问题：`max_num_blocks_per_req` 计算中 `except Exception` 捕获所有异常，fallback 使用 `total_cp_world_size=8`（而非 `min_cp_size=1`），导致 block table 分配不足 8 倍。当 `get_current_vllm_config()` 不可用时，CP=1 请求需要 `cdiv(max_model_len, block_size)` blocks 但只分配了 `cdiv(max_model_len, block_size*8)`
+  - 修复：移除 try/except，因为 `min_cp_size=1` 是常量不依赖配置。同时移除未使用的 `get_current_vllm_config` import
+
+  3. 审查发现但未修复的问题（均为 LOW 或已知设计限制）：
+
+  **调度器**：
+  - LOW: `per_req_cp_sizes` 在抢占后未清理，可能膨胀 `actual_cp_size`（现有守卫缓解）
+  - LOW: `select_dp()` 副作用：清除 `request.cp_ranks`（功能正确但文档不足）
+  - LOW: 所有运行请求都是 CP>1 时抢占死锁（已知设计限制，Session 27 文档化）
+  - LOW: `dycp_has_decode` 一步滞后（保守但安全）
+  - LOW: `_dycp_stall_count` 在任何单 token 进展时重置（可能掩盖部分 hang）
+
+  **注意力后端**：
+  - LOW: `dycp_lse_out_ar` 使用单一 `actual_cp_size` 做 all-reduce（调度器保证单批次单 CP>1 缓解）
+  - LOW: `min(num_dycp_reqs, num_decodes)` 在当前设计下正确（DyCP 模式 prefill/decode 不混合）
+  - LOW: `dycp_rank % pcp_world_size` rank 推导依赖未文档化的对齐不变量
+
+  **CUDA Graph / Block Table**：
+  - LOW: `relax_for_mixed_batch_cudagraphs` 静默禁用 DyCP 混合批次的 CUDA graph（性能问题，已有 cp_size>1 守卫跳过 relaxed 匹配）
+  - LOW: `compute_domain_slot_mapping` 的 `per_req_cp_sizes=None` fallback 使用错误 cp_world_size（当前路径不可达）
+
+  4. 冒烟测试通过（DyCP + LocalPDConnector + Proxy, CUDA graph）：
+     - CP=1 短请求（direct）：✓
+     - CP>1 长请求（direct）：✓
+     - CP>1 长请求（PD via proxy）：✓
+     - 并发混合（2x CP=1 + CP=2 + CP=4 via proxy）：✓ 全部成功
+
+- **下一步**：
+  1. 所有 P0/P1/P2 已完成，MEDIUM/HIGH bug 已修复，LOW 优先级问题可后续处理
+  2. 可考虑：性能优化（如 `dync_has_decode` 过于宽泛的优化）、边界条件压力测试、或长时间稳定性测试
 
 ### 2026-05-05 Session 39
 

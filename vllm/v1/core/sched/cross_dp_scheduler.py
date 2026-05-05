@@ -421,6 +421,48 @@ class CrossDPScheduler(Scheduler):
 
         return kv_xfer_params
 
+    def reset_prefix_cache(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        """Reset the KV prefix cache with DyCP-aware request cleanup.
+
+        Overrides the base class to properly clean up DyCP state
+        (request_manager counters, _active_req_ids, _preempted_cp_ranks,
+        cp_ranks) when preempting running requests. Without this override,
+        the base class _preempt_request does not call request_manager.free_req,
+        causing counter corruption on re-scheduling.
+        """
+        if reset_running_requests:
+            timestamp = time.monotonic()
+            while self.running:
+                request = self.running.pop()
+                # DyCP-aware cleanup: same as the normal preemption path
+                # in schedule().
+                if request.request_id in self._active_req_ids:
+                    self._active_req_ids.discard(request.request_id)
+                    if not self.dycp_enabled:
+                        is_long = self._is_long_request(request)
+                        self.waiting.running_long_count -= (
+                            1 if is_long else 0)
+                    self.request_manager.free_req(request)
+                if request.cp_ranks:
+                    self._preempted_cp_ranks[request.request_id] = (
+                        list(request.cp_ranks))
+                    request.cp_ranks = []
+                self._preempt_request(request, timestamp)
+                request.num_output_placeholders = 0
+                request.discard_latest_async_tokens = True
+            self.prev_step_scheduled_req_ids.clear()
+
+        reset_successful = self.kv_cache_manager.reset_prefix_cache()
+        if reset_running_requests and not reset_successful:
+            raise RuntimeError(
+                "Failed to reset KV cache even when all the running "
+                "requests are preempted and moved to the waiting queue.")
+        if reset_connector and self.connector is not None:
+            self.connector.reset()
+        return reset_successful
+
     def has_finished_requests(self) -> bool:
         return sum(len(sub_ids) for sub_ids in self.finished_req_ids) > 0
 
