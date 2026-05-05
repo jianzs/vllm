@@ -357,6 +357,15 @@ class CrossDPScheduler(Scheduler):
                 # the CP subgroup), not global rank 0 — e.g., a CP=4
                 # request on ranks [4,5,6,7] has cp_ranks[0]=4.
                 request.num_computed_tokens += num_scheduled_token
+            elif len(request.cp_ranks) == 0:
+                # Should not happen: scheduled requests always have
+                # cp_ranks set. If reached, the request will hang
+                # because num_computed_tokens never advances.
+                logger.warning(
+                    "Scheduled request %s has empty cp_ranks — "
+                    "num_computed_tokens will not be updated",
+                    req_id,
+                )
 
             # NOTE: _free_encoder_inputs relies on num_computed_tokens, which
             # may be updated again in _update_from_output for speculative
