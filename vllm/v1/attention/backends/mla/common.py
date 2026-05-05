@@ -621,7 +621,6 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         # TODO(yyj) Remove this once the PCP bug for decode_length > 1 is fixed.
         supports_cp_with_varlen = supports_cp_with_varlen and self.pcp_world_size == 1
 
-        
         # Don't try to access the runner on AMD
         if self.aot_schedule:
             self.page_size = self.kv_cache_spec.block_size
