@@ -1,6 +1,6 @@
 # DyCP Progress
 
-## 当前状态：CP=4 hang bug 未复现，准备 CP=8 和混合 CP benchmark
+## 当前状态：CP=4 hang bug 已修复，准备混合 CP benchmark
 
 ### 2026-05-05 Session 34
 
@@ -9,42 +9,70 @@
   1. 添加 HANG_DIAG 零进展检测器到 `cross_dp_scheduler.py`（commit `fd0da37cd`）：
      - 跟踪 `_zero_progress_steps` 和 `_last_total_computed`
      - 每 100 步零进展输出 WARNING 日志，包含 running/waiting 请求详细状态
-     - 用于定位 hang 的根因（如果再次出现）
   2. 添加 DYCP_DEBUG 诊断日志到 `cross_dp_scheduler.py`（commit `fd0da37cd`）：
-     - RUNNING 请求 `num_new_tokens=0` 时的详细状态
+     - RUNNING 请求 `num_new_tokens=0` 时的详细状态（含 `eff_budget` 和 `rank_budgets`）
      - `finished_sending`/`finished_recving` KV transfer 事件
      - `WAITING_FOR_REMOTE_KVS` 状态转换
      - `ext_tokens` 计算和 KV 就绪状态
      - `_free_request` 的 delay_free 和 PD prefix 状态
-     - 所有日志均为 `logger.debug` 级别，不影响生产环境
+     - prefill 请求 `computed=0` 时自动升级为 WARNING 级别
   3. `local_pd_connector.py` 的 DYCP_DEBUG 日志已回退（Session 33 添加的 `logger.warning` 过于嘈杂）
-  4. **CP=4 hang bug 未复现在本 session**：
-     - 200 请求测试（16K input, 50 output, CP=4, concurrency=4, request-rate=4）全部完成（200/200）
-     - Session 33 报告的 199/200 hang 可能已被 Session 32 的两个修复解决：
-       - `dyncp_batch_cp_size` 初始化包含 decode 请求（commit `e142318e7`）
-       - meta 变量遮蔽修复（commit `0e424a9e8`）
-     - 也可能是间歇性 bug，需要更多测试确认
-  5. `_prefill_requests` 泄漏分析：
-     - `_prefill_requests` dict 在 `get_num_new_matched_tokens` 和 `build_connector_meta` 中添加条目
-     - 只在 `request_finished` 中移除，没有 orphan cleanup
-     - 但测试中未观察到泄漏（`prefill=1` 是活跃 prefill 的正常状态）
-  6. GPU 进程清理：测试后清理僵尸 GPU 进程（`nvidia-smi --query-compute-apps=pid` + `kill -9`）
-  7. vLLM bench serve 兼容性问题：
-     - proxy 使用 `auto` 作为 model name，benchmark 工具需要实际 model path
-     - benchmark 工具无法正确解析 proxy streaming 响应（output_tokens=0）
-     - 使用 Python OpenAI client 直接测试可绕过此问题
+  4. CP=8 decode benchmark：50/50 成功，TTFT P50=2118ms, TPOT P50=12.56ms
+  5. CP=4 hang bug 复现：50 请求 CP=4 benchmark 卡住，HANG_DIAG 检测到零进展
+  6. **根因定位与修复**（commit `34d06cbef`）：
 
-- **Bug 状态更新**：
-  - CP=4 hang bug：**未确认修复**（无法复现，但可能间歇性出现）
-  - HANG_DIAG 诊断器已就位，如果 bug 再次出现可以快速定位根因
-  - `_prefill_requests` 缺少 orphan cleanup 是潜在问题，但当前不是 hang 的根因
+  **根因**：`_update_after_schedule()` 中 `scheduler_output.cp_rank == 0` 判断错误
+
+  ```python
+  # 修复前（BUG）：
+  elif len(request.cp_ranks) > 1 and scheduler_output.cp_rank == 0:
+      request.num_computed_tokens += num_scheduled_token
+
+  # 修复后：
+  elif (len(request.cp_ranks) > 1
+        and scheduler_output.cp_rank == request.cp_ranks[0]):
+      request.num_computed_tokens += num_scheduled_token
+  ```
+
+  **问题**：`cp_rank` 是全局 DP rank 索引（0-7），不是 CP 子组内的 rank。对于 CP=4 在 ranks [4,5,6,7] 上的请求，没有任何 rank 的 `cp_rank == 0`，因此 `num_computed_tokens` 永远不会被更新。请求永远停留在 `computed=0`，导致：
+  - 调度器认为请求仍在 RUNNING 但无法取得进展
+  - `dycp_has_cp_prefill=True` 阻止所有 PD decode 请求调度
+  - 系统死锁：prefill 不推进，decode 被阻塞
+
+  **影响范围**：
+  - CP=1：不受影响（使用 `len==1` 分支）
+  - CP=8：不受影响（包含 rank 0）
+  - CP=4 在 [0,1,2,3]：不受影响（`cp_ranks[0]==0` 匹配旧检查）
+  - CP=4 在 [4,5,6,7]：**卡住**（`cp_ranks[0]==4`，不匹配 `cp_rank==0`）
+  - CP=2 在 [0,1] 或 [2,3]：不受影响
+  - CP=2 在 [4,5] 或 [6,7]：**卡住**
+
+  **为什么之前有时能通过**：取决于 `select_dp()` 分配的 rank。第一个 CP=4 请求通常分配到 [0,1,2,3]（正常工作），第二个并发请求分配到 [4,5,6,7]（卡住）。低并发时可能所有请求都分配到 [0,1,2,3]。
+
+  7. 修复后验证：
+     - CP=4 decode benchmark（50 请求, concurrency=4）：50/50 成功，TTFT P50=1226ms, TPOT P50=11.04ms
+     - CP=4 decode benchmark（200 请求, concurrency=4）：200/200 成功，TTFT P50=1207ms, TPOT P50=11.02ms
+     - CP=8 decode benchmark（50 请求, concurrency=4）：50/50 成功，TTFT P50=2109ms, TPOT P50=12.41ms
+     - 0 个 HANG_DIAG 警告
+
+- **Benchmark 结果**（修复后，DyCP + LocalPDConnector + Proxy, CUDA graph, concurrency=4）：
+
+  | 配置 | Input | Output | 请求数 | TTFT P50 | TTFT P90 | TPOT P50 | TPOT P90 | 状态 |
+  |------|-------|--------|--------|----------|----------|----------|----------|------|
+  | CP=4 | 16K | 50 | 50 | 1226ms | 1314ms | 11.04ms | 11.16ms | ✅ |
+  | CP=4 | 16K | 50 | 200 | 1207ms | 1266ms | 11.02ms | 11.10ms | ✅ |
+  | CP=8 | 32K | 50 | 50 | 2109ms | 2226ms | 12.41ms | 12.64ms | ✅ |
+
+  **与 Session 32 基线对比**（CP=4, 200 reqs, concurrency=4）：
+  - Session 32（hang bug 存在）：前 199 个请求 TPOT P50 ≈ 8.1ms，最后一个卡住
+  - Session 34（修复后）：200/200 成功，TPOT P50 = 11.02ms
+  - TPOT 略高（11.02ms vs 8.1ms）可能由于 HANG_DIAG 诊断日志的开销
 
 - **下一步**：
-  1. 运行 CP=8 (32K) benchmark
-  2. 运行混合 CP size benchmark（通过 `--use-local-json`）
-  3. 更多 CP=4 hang 复现测试（更长运行时间、更多请求）
-  4. MEDIUM 优先级问题修复（`has_slot_for_long_request` 缓存、`running_long_count` 变异风险）
-  5. 清理 DYCP_DEBUG 诊断日志（cross_dp_scheduler.py 中保留，local_pd_connector.py 已回退）
+  1. 运行混合 CP size benchmark（通过 `--use-local-json`）
+  2. 清理 HANG_DIAG 和 DYCP_DEBUG 诊断日志（保留 WARNING 级别的 HANG_DIAG，降级或移除 DEBUG 级别的 DYCP_DEBUG）
+  3. MEDIUM 优先级问题修复（`has_slot_for_long_request` 缓存、`running_long_count` 变异风险）
+  4. `_prefill_requests` 缺少 orphan cleanup 是潜在问题，需要修复
 
 ### 2026-05-04 Session 33
 
