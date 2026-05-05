@@ -474,6 +474,7 @@ class LocalPDConnector(KVConnectorBase_V1):
 
         if kv_params.get("do_remote_decode"):
             # Prefill request: track for KV saving, execute normally
+            kv_params["_start_time_ms"] = _time.monotonic() * 1000
             self._prefill_requests[request.request_id] = kv_params
             logger.debug(
                 "Tracked prefill req=%s, _prefill_requests now has %d entries",
@@ -730,6 +731,23 @@ class LocalPDConnector(KVConnectorBase_V1):
                 elif orphan_meta and orphan_meta.get("prefill_req_id"):
                     self._orphaned_prefill_ids_to_free.add(
                         orphan_meta["prefill_req_id"])
+
+        # Cleanup stale _prefill_requests entries (prefill cancelled before
+        # finishing). These entries should be short-lived; any entry older
+        # than the orphan timeout is leaked.
+        if cp_rank == 0 and self._prefill_requests:
+            stale_prefills = [
+                rid for rid, kv in self._prefill_requests.items()
+                if now_ms - kv.get("_start_time_ms", now_ms)
+                > self._orphan_timeout_s * 1000
+            ]
+            for rid in stale_prefills:
+                logger.warning(
+                    "Cleaning stale _prefill_requests entry req=%s "
+                    "(no completion after %.0fs)",
+                    rid, self._orphan_timeout_s,
+                )
+                self._prefill_requests.pop(rid, None)
 
         # Only remove requests that were actually processed this step.
         # Unconditionally clearing loses registrations for requests that

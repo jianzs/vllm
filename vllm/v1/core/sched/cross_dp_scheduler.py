@@ -379,11 +379,12 @@ class CrossDPScheduler(Scheduler):
             # PD requests are classified as short (CP=1) at schedule time,
             # so they must also be classified as short at free time to keep
             # running_long_count consistent.
-            is_long = self._is_long_request(request)
-            self.waiting.running_long_count -= 1 if is_long else 0
+            if not self.dycp_enabled:
+                is_long = self._is_long_request(request)
+                self.waiting.running_long_count -= 1 if is_long else 0
+                self.waiting.has_slot_for_long_request = \
+                    self.request_manager.has_slot_for_long_request()
             self.request_manager.free_req(request)
-            self.waiting.has_slot_for_long_request = \
-                self.request_manager.has_slot_for_long_request()
 
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
@@ -917,9 +918,10 @@ class CrossDPScheduler(Scheduler):
                                 break
                         self._active_req_ids.discard(preempted_req.request_id)
                         self.request_manager.free_req(preempted_req)
-                        _is_long = self._is_long_request(preempted_req)
-                        self.waiting.running_long_count -= 1 if _is_long else 0
-                        self.waiting.has_slot_for_long_request = self.request_manager.has_slot_for_long_request()
+                        if not self.dycp_enabled:
+                            _is_long = self._is_long_request(preempted_req)
+                            self.waiting.running_long_count -= 1 if _is_long else 0
+                            self.waiting.has_slot_for_long_request = self.request_manager.has_slot_for_long_request()
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
 
@@ -1281,9 +1283,10 @@ class CrossDPScheduler(Scheduler):
                 # Clean up saved preempted cp_ranks since the request
                 # has been re-scheduled with new cp_ranks.
                 self._preempted_cp_ranks.pop(request.request_id, None)
-                self.waiting.running_long_count += 1 if is_long else 0
+                if not self.dycp_enabled:
+                    self.waiting.running_long_count += 1 if is_long else 0
+                    self.waiting.has_slot_for_long_request = self.request_manager.has_slot_for_long_request()
                 self.request_manager.add_req(request)
-                self.waiting.has_slot_for_long_request = self.request_manager.has_slot_for_long_request()
 
                 if self.log_stats:
                     request.record_event(
