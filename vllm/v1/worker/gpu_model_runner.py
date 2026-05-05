@@ -1632,20 +1632,31 @@ class GPUModelRunner(
 
         if self.dycp_world_size > 1:
             per_req_cp_sizes_np = None
-            if scheduler_output.per_req_cp_sizes is not None:
-                per_req_cp_sizes_np = np.ones(num_reqs, dtype=np.int32)
-                for req_idx in range(num_reqs):
-                    req_id = self.input_batch.req_ids[req_idx]
-                    if req_id in scheduler_output.per_req_cp_sizes:
-                        per_req_cp_sizes_np[req_idx] = (
-                            scheduler_output.per_req_cp_sizes[req_id]
-                        )
+            if scheduler_output.num_cp_request > 0:
+                # Only build per_req_cp_sizes_np when there are CP>1 requests.
+                # When all requests are CP=1, per_req_cp_sizes_np is None and
+                # downstream code uses actual_cp_size=1 as fallback.
+                if scheduler_output.per_req_cp_sizes is not None:
+                    per_req_cp_sizes_np = np.ones(num_reqs, dtype=np.int32)
+                    for req_idx in range(num_reqs):
+                        req_id = self.input_batch.req_ids[req_idx]
+                        if req_id in scheduler_output.per_req_cp_sizes:
+                            per_req_cp_sizes_np[req_idx] = (
+                                scheduler_output.per_req_cp_sizes[req_id]
+                            )
             self._per_req_cp_sizes_np = per_req_cp_sizes_np
-            self.input_batch.block_table.compute_domain_slot_mapping(
-                req_indices, positions_np,
-                scheduler_output.num_cp_request,
-                per_req_cp_sizes_np,
-            )
+            # When no CP>1 requests exist, fall back to the faster
+            # compute_slot_mapping which avoids the extra np.zeros
+            # allocation and final copy of compute_domain_slot_mapping.
+            if scheduler_output.num_cp_request == 0:
+                self.input_batch.block_table.compute_slot_mapping(
+                    req_indices, positions_np)
+            else:
+                self.input_batch.block_table.compute_domain_slot_mapping(
+                    req_indices, positions_np,
+                    scheduler_output.num_cp_request,
+                    per_req_cp_sizes_np,
+                )
         else:
             self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
 
