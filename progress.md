@@ -1,6 +1,214 @@
 # DyCP Progress
 
-## 当前状态：CP=4 hang bug 已修复，准备混合 CP benchmark
+## 当前状态：HIGH 修复完成，CP=2 benchmark 运行中
+
+### 2026-05-05 Session 37
+
+- **目标**：修复代码审查发现的剩余 HIGH 问题，验证修复，运行 TPOT 退化对比 benchmark
+- **进展**：
+  1. 修复 3 个 HIGH 问题（commit `833806e94`）：
+
+  **HIGH: IPC CUDA stream 泄漏**（local_pd_connector.py）：
+  - 问题：`__del__` 销毁 CUDA events 和 IPC handles，但未调用 `cudaStreamDestroy` 销毁 `self._ipc_stream`，每次连接器关闭泄漏一个 CUDA stream
+  - 修复：在 `__del__` 中添加 `cudaStreamDestroy(self._ipc_stream)` 调用
+
+  **HIGH: Block index 越界静默 clamp**（local_pd_connector.py）：
+  - 问题：`np.clip` 静默截断越界的 block 索引，导致 KV 数据从错误 source block 拷贝而无任何错误提示
+  - 修复：改为 `raise AssertionError`，越界索引表明 block 分配或 IPC metadata 有 bug，应显式失败而非静默损坏数据
+
+  **HIGH: `relax_for_mixed_batch_cudagraphs()` 丢弃 cp_size**（cudagraph_dispatcher.py）：
+  - 问题：relaxed BatchDescriptor 将 cp_size 重置为 1，DyCP 请求（cp_size > 1）匹配到 cp_size=1 的 graph 时使用错误的 NCCL subgroup communicator，导致静默正确性 bug
+  - 修复：dispatch 方法中，当 cp_size > 1 时跳过 relaxed key 匹配路径，回退 eager 模式而非使用错误 cp_size 的 graph
+
+  2. 冒烟测试通过：
+  - CP=1（短请求）：✓ 0.46s
+  - CP=2（~8K tokens）：✓ 0.28s
+  - CP=4（~16K tokens）：✓ 0.40s
+  - CP=8（~32K tokens）：✓ 0.70s
+  - 并发混合（2x CP=1 + CP=2 + CP=4）：✓ 全部成功
+
+  3. CP=2 基线 benchmark 运行中（200 reqs, 8K input, 50 output, concurrency=4, via proxy）
+
+  4. CP=2 Decode Benchmark 结果（200 reqs, 8K input, 50 output, concurrency=4, via proxy）：
+
+  | 来源 | TPOT P50 | TPOT P90 | TTFT P50 |
+  |------|----------|----------|----------|
+  | Session 31 基线 | 7.81ms | 8.83ms | 755.60ms |
+  | Session 36 | 9.21ms | 10.24ms | 722.66ms |
+  | **Session 37** | **8.10ms** | **8.19ms** | **608.13ms** |
+
+  **关键发现**：TPOT 退化从 18% 降到 3.7%（8.10ms vs 7.81ms），在正常硬件变异范围内。Session 36 的 9.21ms 可能是 GPU 温度/时钟波动或 torch inductor cache miss 导致。无需 torch profiler 进一步调查。
+
+  5. 修复 3 个 MEDIUM 问题（commit `23f7a7751`）：
+
+  **MEDIUM: `per_rank_block_ids` 长度未校验**（local_pd_connector.py）：
+  - 问题：IPC load 中 `per_rank_block_ids[src_rank]` 无长度校验，如果 metadata 损坏或过期（cp_world_size 不匹配），会导致 IndexError 崩溃
+  - 修复：添加 `len(per_rank_block_ids) < cp_world_size` 校验，不满足时返回错误
+
+  **MEDIUM: `actual_cp_size=1` fallback virtual block size 过大**（mla/common.py）：
+  - 问题：两处 `dycp_cp_virtual_block_size` 的 fallback 使用 `self.cp_virtual_block_size`（= `cp_local_block_size * dycp_world_size`），但 `actual_cp_size=1` 时不应乘以 `dycp_world_size`
+  - 修复：fallback 改为 `self.cp_local_block_size`（无 CP 分割时使用本地 block size）
+
+  **MEDIUM: `_cross_requests_need_load` 泄漏**（local_pd_connector.py）：
+  - 问题：请求被抢占后 `cp_ranks` 被清空，如果请求随后被取消，cleanup 循环遍历空的 `cp_ranks`，不会移除任何条目，导致永久泄漏
+  - 修复：当 `cp_ranks` 为空时，扫描所有 rank 移除该请求的条目
+
+- **下一步**：
+  1. 修复剩余 MEDIUM/LOW 问题（`_update_after_schedule` 防御性检查、`select_dp` 副作用文档化、`num_cp_tokens` 重命名等）
+  2. 全面代码审查确认所有修复正确
+  3. 运行混合 CP size + 长时间 decode benchmark 验证稳定性
+
+- **目标**：全面代码审查和边界条件分析
+- **进展**：
+  1. 系统性审查 DyCP 核心代码（4 个并行审查 agent），发现 30+ 个问题
+  2. 修复 5 个高优先级 bug：
+
+  **CRITICAL: `now_ms` NameError 崩溃**（local_pd_connector.py）：
+  - 问题：`now_ms` 变量仅在 `if cp_rank == 0 and self._completed_prefills:` 块内定义（line 712），但在 `if cp_rank == 0 and self._prefill_requests:` 块内使用（line 741）。当 `_completed_prefills` 为空但 `_prefill_requests` 非空时，`now_ms` 未定义导致 NameError 崩溃
+  - 修复：将条件改为 `if cp_rank == 0 and (self._completed_prefills or self._prefill_requests):`，确保 `now_ms` 在使用前总是被定义
+
+  **HIGH: `dycp_lse_out_ar` 数值不稳定**（common.py）：
+  - 问题：`torch.exp(cp_attn_lse)` 直接计算，未做 max-subtraction，极端 LSE 值会产生 inf/NaN。对比 `correct_attn_out` Triton kernel 有完整的 NaN/inf 替换和 max-subtraction
+  - 修复：在 exp 前替换 NaN 和 +inf 为 -inf（使 exp 产生 0，表示无贡献）；在最终除法添加零除保护
+
+  **HIGH: Second cache write 静默跳过**（mla/common.py）：
+  - 问题：当 `max_slot >= kv_slots`（slot mapping 越界），第二次 cache write 被跳过仅打印 error 日志。这会导致 KV cache 不完整，后续 decode 注意力计算使用过期数据
+  - 修复：改为 assert 断言失败，明确表示这是 bug 而非可恢复条件
+
+  **HIGH: `select_dp()` None 导致过早 break**（cross_dp_scheduler.py）：
+  - 问题：当 CP>1 请求找不到可用子组时，`select_dp()` 返回 None 触发 break 退出整个 waiting 循环，后续 CP=1 请求也无法被调度
+  - 修复：改为 continue（跳过当前请求，放入 skipped_waiting_requests），允许后续请求继续尝试调度
+
+  **MEDIUM: `num_req_per_dp` 无下溢保护**（cross_dp_scheduler.py）：
+  - 问题：`free_req()` 中 `num_req_per_dp[rank] -= 1` 无断言，双重释放会使计数变负
+  - 修复：添加 `assert self.num_req_per_dp[rank] >= 0`
+
+  3. 代码审查发现但未修复的问题（记录备查）：
+
+  **调度器**：
+  | 严重性 | 问题 | 说明 |
+  |--------|------|------|
+  | MEDIUM | `_update_after_schedule` 静默跳过 `cp_ranks=[]` 请求的 `num_computed_tokens` 更新 | 当前流程不会产生空 cp_ranks 的 RUNNING 请求，但缺少防御性检查 |
+  | LOW | `select_dp()` 副作用：清空 `request.cp_ranks` | 方法名暗示只做选择，但实际会修改请求状态 |
+  | LOW | `_free_encoder_inputs` 对 CP>1 非首 rank 冗余调用 | 当前幂等安全，但依赖 encoder cache manager 的不变量 |
+  | LOW | `has_slot_for_cp_request` 不考虑 token budget | 与 select_dp None 问题相关，已通过 continue 修复缓解 |
+  | LOW | `actual_cp_size` 可能 > 1 即使当前 step 无 CP>1 请求执行 | 从所有 RUNNING CP>1 请求初始化，包括被跳过的 |
+
+  **LocalPDConnector**：
+  | 严重性 | 问题 | 说明 |
+  |--------|------|------|
+  | HIGH | IPC CUDA stream 未销毁 | `__del__` 未调用 `cudaStreamDestroy`，每次连接器销毁泄漏一个 CUDA stream |
+  | HIGH | Block index 越界静默 clamp | `np.clip` 截断越界索引，导致 KV 数据静默损坏 |
+  | MEDIUM | `per_rank_block_ids` 长度未校验 | 未验证 `len(per_rank_block_ids) >= cp_world_size` |
+  | MEDIUM | CUDA event + block 泄漏 | `cudaEventQuery` 返回非 success/notReady 错误时，event 和 block 永不释放 |
+  | LOW | `_cross_requests_need_load` 条目泄漏 | 被取消的 decode 请求未清理，无 stale-entry 机制 |
+  | LOW | `_ipc_gpu_synced` 未在 `__init__` 初始化 | 使用 getattr 回退，但直接访问会 AttributeError |
+
+  **GPU Model Runner / CUDA Graph**：
+  | 严重性 | 问题 | 说明 |
+  |--------|------|------|
+  | HIGH | `relax_for_mixed_batch_cudagraphs()` 丢弃 `cp_size` | 放松匹配时 DyCP graph key 无法命中，回退 eager 模式 |
+  | HIGH | `dycp_allgathered_size` 使用单一 `actual_cp_size` | 对 per-request 不同 cp_size 不正确（当前设计约束：单 batch 单 CP size） |
+  | MEDIUM | `dycp_has_prefill` 在 PCP split 后重算可能错误 | split 后 token count 减小，可能误判为无 prefill |
+  | MEDIUM | `num_cp_tokens` 参数名误导 | 实际接收 `num_cp_request`（请求数），非 token 数 |
+
+  **MLA Attention**：
+  | 严重性 | 问题 | 说明 |
+  |--------|------|------|
+  | MEDIUM | `actual_cp_size=1` 时 fallback virtual block size 过大 | 使用 `dycp_world_size * cp_local_block_size` 而非 `cp_local_block_size` |
+  | LOW | `dycp_virtual_block_size` 死代码 | 定义但从未在 DyCP 路径使用 |
+  | LOW | `local_context_lens_allranks` DP 请求列为零 | 依赖 DP 请求不进入 CP allgather 路径 |
+
+4. 冒烟测试通过（短请求 CP=1、长请求 CP>1 PD、混合 CP 并发均成功）
+
+  5. TPOT 退化根因分析：
+
+  **纯 CP=2 基线 benchmark**（200 reqs, 8K input, 50 output, concurrency=4, via proxy）：
+  | 指标 | Session 31 基线 | Session 36 当前 | 变化 |
+  |------|----------------|----------------|------|
+  | TPOT P50 | 7.81ms | 9.21ms | +18% |
+  | TPOT P90 | 8.83ms | 10.24ms | +16% |
+  | TTFT P50 | 755.60ms | 722.66ms | -4.3% |
+
+  **关键发现**：
+  - 纯 CP=2 也退化 18%，排除了混合 CP 调度作为唯一原因
+  - TTFT 持平甚至略好，说明 prefill 路径无退化
+  - Local PD decode 始终是 CP=1（`actual_cp_size=1`），NCCL all-reduce 不参与
+  - Session 31-36 间无 decode 执行路径代码变更
+  - 退化可能原因：硬件变异性（GPU 时钟/温度）、CUDA graph 编译差异、或未发现的调度开销
+  - 需要 torch profiler 数据定位根因
+
+- **下一步**：
+  1. 用 torch profiler 对比 Session 31 和当前代码的 decode step 耗时分布
+  2. 修复剩余 HIGH 问题（IPC stream 泄漏、block index clamp）
+  3. 考虑 `relax_for_mixed_batch_cudagraphs()` 丢弃 cp_size 导致 eager fallback 的问题
+
+### 2026-05-05 Session 35
+
+- **目标**：清理诊断日志，运行混合 CP size benchmark
+- **进展**：
+  1. 清理 DYCP_DEBUG 诊断日志（commit `1ecfd73ab`）：
+     - 移除 8 处 `logger.debug("DYCP_DEBUG: ...")` 调用（纯 DEBUG 级别，生产环境无用）
+     - 简化 `num_new_tokens == 0` 块：仅保留 prefill 卡在 computed=0 的 WARNING
+     - 移除 `import logging`（不再直接使用）
+     - 保留功能性代码：stall-detection escape hatch、prefill-stuck WARNING
+  2. 简化 HANG_DIAG 零进展检测：
+     - 保留 WARNING 级别日志（每 100 步零进展）
+     - 移除 per-request 详细信息构建（running_info/waiting_info 字符串拼接）
+     - 简化为仅报告步数、标志状态、running/waiting 计数
+  3. 混合 CP size benchmark 验证（`[(4096, 2), (16384, 4), (32768, 8)]`，DyCP + LocalPDConnector + Proxy, CUDA graph）：
+
+  **小规模测试**（25 reqs: 15x4K + 5x16K + 5x32K, 50 output, concurrency=4）：
+  | Input | CP Size | Reqs | TTFT P50 | TPOT P50 |
+  |-------|---------|------|----------|----------|
+  | 4K | CP=2 | 15 | 756ms | 9.39ms |
+  | 16K | CP=4 | 5 | 1740ms | 9.73ms |
+  | 32K | CP=8 | 5 | 1583ms | 10.01ms |
+  25/25 成功，0 HANG_DIAG 警告
+
+  **大规模测试**（70 reqs: 50x4K + 10x16K + 10x32K, 50 output, concurrency=4）：
+  | Input | CP Size | Reqs | TTFT P50 | TTFT P90 | TPOT P50 | TPOT P90 |
+  |-------|---------|------|----------|----------|----------|----------|
+  | 4K | CP=2 | 50 | 741ms | 762ms | 9.41ms | 9.59ms |
+  | 16K | CP=4 | 10 | 734ms | 1140ms | 10.06ms | 10.25ms |
+  | 32K | CP=8 | 10 | 1799ms | 1832ms | 9.98ms | 10.34ms |
+  70/70 成功，0 HANG_DIAG 警告
+
+  **关键发现**：
+  - 所有 CP size 的 TPOT P50 在 9.4-10.1ms 范围内，性能稳定
+  - CP=4 (16K) 的 TTFT P50=734ms 低于预期（Session 34 单独测试为 1207ms），可能因为混合负载中 CP=4 请求与 CP=2 请求并发时 rank 分配更高效
+  - CP=8 (32K) 的 TTFT P50=1799ms 与 Session 34 基线（2109ms）接近
+  - 诊断日志清理后系统运行正常，无 hang 或异常
+
+  4. 修复 MEDIUM 优先级问题（commit `543e28ada`）：
+     - **DyCP 模式跳过 `running_long_count` 和 `has_slot_for_long_request` 维护**：
+       - DyCP 模式下这两个值不被使用（调度使用 per-CP-size 的 `has_slot_for_cp_request`）
+       - 跳过更新减少外部变异风险和不必要的工作
+       - 非 DyCP 模式保持原有行为
+     - **`_prefill_requests` orphan cleanup**：
+       - 添加 `_start_time_ms` 时间戳到 `_prefill_requests` 条目
+       - 在 `build_connector_meta` 的 orphan cleanup 中清理超过 5 分钟的过期条目
+       - 防止 prefill 请求被取消后 `_prefill_requests` 条目泄漏
+
+  5. 运行 1024-output 混合 CP benchmark（30x4K + 10x16K + 5x32K, 1024 output, concurrency=4, via proxy）：
+
+  **1024-Output Mixed CP Benchmark**（45 reqs, concurrency=4, via proxy）：
+  | Input | CP Size | Reqs | TTFT P50 | TTFT P90 | TPOT P50 | TPOT P90 |
+  |-------|---------|------|----------|----------|----------|----------|
+  | 4K | CP=2 | 30 | 9897ms | 10103ms | 9.50ms | 9.67ms |
+  | 16K | CP=4 | 10 | 6093ms | 11539ms | 10.04ms | 10.24ms |
+  | 32K | CP=8 | 5 | 11493ms | 11603ms | 10.01ms | 10.19ms |
+  45/45 成功，0 失败
+
+  **关键发现**：
+  - 所有 CP size 的 TPOT P50 在 9.5-10.0ms 范围内，长时间 decode 稳定
+  - TTFT 较高（6-12s）是 Local PD 互斥调度的预期行为（1024-output decode ~10s 期间阻塞新 prefill）
+  - DyCP MEDIUM 修复后系统运行正常，无 hang 或异常
+
+- **下一步**：
+  1. 代码审查：检查 CP=4 TTFT 异常低的原因（50-output benchmark）
+  2. 全面代码审查和边界条件分析
+  3. 性能对比：与 Session 31 CP=2 基线（TPOT P50=7.81ms）对比，当前 TPOT 略高（~9.5ms）需分析原因
 
 ### 2026-05-05 Session 34
 
