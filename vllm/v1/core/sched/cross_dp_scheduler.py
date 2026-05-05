@@ -1017,11 +1017,13 @@ class CrossDPScheduler(Scheduler):
             _deduct_budget(request.cp_ranks, num_new_tokens)
             req_index += 1
 
-        # DyCP: when any decode request is running, avoid mixing prefill
-        # and decode across DP ranks in the same step. The MoE all-to-all
+        # DyCP: when CP>1 decode is running, defer new prefills to avoid
+        # mixing prefill and CP>1 decode across DP ranks. The MoE all-to-all
         # forces all ranks to synchronize, so decode ranks would wait for
         # slower prefill ranks, degrading TPOT from ~7ms to ~80ms.
-        # Instead, defer prefill to the next step.
+        # When only CP=1 decode is running, prefills are not deferred because
+        # CP=1 ranks are independent DP ranks — the MoE sync behavior matches
+        # the non-DyCP DP baseline, and mixing is safe (same as baseline).
         # ESCAPE HATCH: if decode makes zero progress for
         # _DYCP_STALL_LIMIT consecutive steps (stuck due to NCCL hang,
         # KV transfer stall, etc.), force-allow prefills to prevent
@@ -1048,8 +1050,19 @@ class CrossDPScheduler(Scheduler):
         else:
             self._dycp_stall_count = 0
             self._last_decode_computed = 0
+        # Only defer prefills when CP>1 decode is running. CP=1-only decode
+        # does not need deferral — its MoE all-to-all behavior is identical
+        # to the non-DyCP DP baseline where prefill/decode mixing is allowed.
+        dycp_has_cp_decode = (
+            self.dycp_enabled
+            and any(
+                len(req.cp_ranks) > 1
+                and req.num_computed_tokens >= req.num_prompt_tokens
+                for req in self.running
+            )
+        )
         dycp_defer_prefills = (
-            dycp_has_decode
+            dycp_has_cp_decode
             and self._dycp_stall_count < _DYCP_STALL_LIMIT
         )
         # Check if any running request is a CP>1 prefill (still computing
@@ -1081,10 +1094,11 @@ class CrossDPScheduler(Scheduler):
         if self._zero_progress_steps > 0 and self._zero_progress_steps % 100 == 0:
             logger.warning(
                 "Zero progress for %d steps: "
-                "has_decode=%s has_cp_prefill=%s "
+                "has_decode=%s has_cp_decode=%s has_cp_prefill=%s "
                 "stall_count=%d running=%d waiting=%d",
                 self._zero_progress_steps,
-                dycp_has_decode, dycp_has_cp_prefill,
+                dycp_has_decode, dycp_has_cp_decode,
+                dycp_has_cp_prefill,
                 self._dycp_stall_count,
                 len(self.running), len(self.waiting))
 
@@ -1122,9 +1136,9 @@ class CrossDPScheduler(Scheduler):
                     # communication is needed during decode.
                     if kv_params and kv_params.get("do_remote_prefill"):
                         req_cp_size = 1
-                    # When decode is already running, defer new prefill
-                    # requests to avoid MoE all-to-all sync bottleneck
-                    # across mixed-phase DP ranks.
+                    # When CP>1 decode is running, defer new prefill requests
+                    # to avoid MoE all-to-all sync bottleneck across
+                    # mixed-phase DP ranks.
                     # PD decode requests (do_remote_prefill) load KV via IPC
                     # memory copy, not a full prefill forward pass, so they
                     # don't cause MoE sync issues and should not be deferred.
