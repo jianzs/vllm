@@ -194,9 +194,15 @@ class CudagraphDispatcher:
             if batch_desc in self.cudagraph_keys[CUDAGraphMode.FULL]:
                 return CUDAGraphMode.FULL, batch_desc
 
-            # otherwise, check if the relaxed key exists
-            if relaxed_batch_desc in self.cudagraph_keys[CUDAGraphMode.FULL]:
-                return CUDAGraphMode.FULL, relaxed_batch_desc
+            # When DyCP is active (cp_size > 1), the relaxed key drops
+            # cp_size to 1, which would replay a graph captured with the
+            # wrong NCCL subgroup — a silent correctness bug.  Fall back
+            # to eager mode instead.
+            if cp_size <= 1:
+                # otherwise, check if the relaxed key exists
+                if relaxed_batch_desc in self.cudagraph_keys[
+                        CUDAGraphMode.FULL]:
+                    return CUDAGraphMode.FULL, relaxed_batch_desc
 
         # also check if the relaxed key exists for more "general"
         # piecewise cudagraph

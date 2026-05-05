@@ -1051,18 +1051,15 @@ class LocalPDConnector(KVConnectorBase_V1):
                 )
                 continue
             if np.any(rank_block_indices >= len(src_block_ids_arr)):
-                logger.error(
-                    "IPC load: block index out of range for src_rank=%d "
-                    "prefix=%s: max_idx=%d, num_blocks=%d. "
-                    "Clamping — output may be incorrect!",
-                    src_rank, prefix,
-                    int(rank_block_indices.max()),
-                    len(src_block_ids_arr),
+                # Out-of-bounds block indices indicate a bug in block
+                # allocation or IPC metadata — silent clamp would produce
+                # wrong KV data.  Fail loudly so the root cause is fixed.
+                raise AssertionError(
+                    f"IPC load: block index out of range for src_rank="
+                    f"{src_rank} prefix={prefix}: max_idx="
+                    f"{int(rank_block_indices.max())}, num_blocks="
+                    f"{len(src_block_ids_arr)}"
                 )
-            rank_block_indices = np.clip(
-                rank_block_indices, 0,
-                len(src_block_ids_arr) - 1,
-            )
             src_block_ids_actual = src_block_ids_arr[rank_block_indices]
             dst_slots = dst_slot_mapping[rank_positions].numpy()
             dst_block_ids_actual = dst_slots // block_size
@@ -1401,6 +1398,15 @@ class LocalPDConnector(KVConnectorBase_V1):
                     except Exception:
                         pass
             self._ipc_pending_events.clear()
+        # Destroy the dedicated IPC CUDA stream.
+        if self._cuda_lib and hasattr(self, '_ipc_stream') and self._ipc_stream:
+            destroy_fn = self._cuda_lib.funcs.get("cudaStreamDestroy")
+            if destroy_fn:
+                try:
+                    destroy_fn(self._ipc_stream)
+                except Exception:
+                    pass
+            self._ipc_stream = None
         # Close IPC memory handles to release GPU virtual address space.
         self._close_ipc_handles()
 
