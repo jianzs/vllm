@@ -1645,18 +1645,15 @@ class GPUModelRunner(
                                 scheduler_output.per_req_cp_sizes[req_id]
                             )
             self._per_req_cp_sizes_np = per_req_cp_sizes_np
-            # When no CP>1 requests exist, fall back to the faster
-            # compute_slot_mapping which avoids the extra np.zeros
-            # allocation and final copy of compute_domain_slot_mapping.
-            if scheduler_output.num_cp_request == 0:
-                self.input_batch.block_table.compute_slot_mapping(
-                    req_indices, positions_np)
-            else:
-                self.input_batch.block_table.compute_domain_slot_mapping(
-                    req_indices, positions_np,
-                    scheduler_output.num_cp_request,
-                    per_req_cp_sizes_np,
-                )
+            # compute_domain_slot_mapping with num_dycp_reqs=0 correctly
+            # routes all requests through the non-interleaved DP path.
+            # Do NOT use compute_slot_mapping here: when total_cp_world_size>1
+            # it applies N-way interleave which is wrong for CP=1 requests.
+            self.input_batch.block_table.compute_domain_slot_mapping(
+                req_indices, positions_np,
+                scheduler_output.num_cp_request,
+                per_req_cp_sizes_np,
+            )
         else:
             self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
 
