@@ -307,6 +307,10 @@ class CrossDPScheduler(Scheduler):
         self._dycp_stall_count: int = 0
         self._last_decode_computed: int = 0
 
+        # Diagnostics: track zero-progress steps to detect hangs
+        self._zero_progress_steps: int = 0
+        self._last_total_computed: int = 0
+
     def _is_long_request(self, request: Request) -> bool:
         """Classify a request as long or short, applying PD overrides.
 
@@ -377,6 +381,14 @@ class CrossDPScheduler(Scheduler):
                 self.request_manager.has_slot_for_long_request()
 
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+        if delay_free_blocks or (kv_xfer_params and kv_xfer_params.get("pd_request_prefix")):
+            logger.debug(
+                        "DYCP_DEBUG: _free_request req=%s delay_free=%s "
+                "has_pd_prefix=%s running=%d",
+                request.request_id, delay_free_blocks,
+                bool(kv_xfer_params and kv_xfer_params.get("pd_request_prefix")),
+                len(self.running),
+            )
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         # Use saved preempted cp_ranks if the request was preempted
@@ -412,14 +424,23 @@ class CrossDPScheduler(Scheduler):
             self.connector.bind_connector_metadata(None)
 
         for req_id in kv_connector_output.finished_recving or ():
-            logger.debug("Finished recving KV transfer for request %s",
-                         req_id)
+            logger.debug(
+                        "DYCP_DEBUG: finished_recving for req=%s, "
+                "in requests=%s, status=%s",
+                req_id,
+                req_id in self.requests,
+                self.requests[req_id].status if req_id in self.requests else "N/A",
+            )
             self.finished_recving_kv_req_ids.add(req_id)
         for req_id in kv_connector_output.finished_sending or ():
             if req_id in self.requests:
+                req = self.requests[req_id]
                 logger.debug(
-                    "Finished sending KV transfer for request %s", req_id)
-                self._free_blocks(self.requests[req_id])
+                        "DYCP_DEBUG: finished_sending freeing blocks for "
+                    "req=%s cp_ranks=%s running=%d",
+                    req_id, req.cp_ranks, len(self.running),
+                )
+                self._free_blocks(req)
             else:
                 logger.debug(
                     "Skipping finished_sending for already-freed %s",
@@ -846,18 +867,28 @@ class CrossDPScheduler(Scheduler):
             """
 
             if num_new_tokens == 0:
-                # The request cannot be scheduled because one of the following
-                # reasons:
-                # 1. No new tokens to schedule. This may happen when
-                #    (1) PP>1 and we have already scheduled all prompt tokens
-                #    but they are not finished yet.
-                #    (2) Async scheduling and the request has reached to either
-                #    its max_total_tokens or max_model_len.
-                # 2. The encoder budget is exhausted.
-                # 3. The encoder cache is exhausted.
-                # NOTE(woosuk): Here, by doing `continue` instead of `break`,
-                # we do not strictly follow the FCFS scheduling policy and
-                # allow the lower-priority requests to be scheduled.
+                # DYCP_DEBUG: log detailed state when a RUNNING request
+                # has num_new_tokens == 0 (potential hang indicator).
+                kv_params = request.kv_transfer_params
+                is_pd_decode = (
+                    kv_params and kv_params.get("do_remote_prefill"))
+                if is_pd_decode or len(self.running) <= 2:
+                    logger.debug(
+                        "DYCP_DEBUG: RUNNING req=%s num_new_tokens=0 "
+                        "num_computed=%d num_tokens_with_spec=%d "
+                        "num_output_placeholders=%d num_prompt=%d "
+                        "num_tokens=%d cp_ranks=%s is_pd_decode=%s "
+                        "running_count=%d",
+                        request.request_id,
+                        request.num_computed_tokens,
+                        request.num_tokens_with_spec,
+                        request.num_output_placeholders,
+                        request.num_prompt_tokens,
+                        request.num_tokens,
+                        request.cp_ranks,
+                        is_pd_decode,
+                        len(self.running),
+                    )
                 req_index += 1
                 continue
 
@@ -1003,6 +1034,49 @@ class CrossDPScheduler(Scheduler):
                 "Decode may be stuck (NCCL hang or KV transfer stall).",
                 self._dycp_stall_count)
 
+        # HANG_DIAG: detect and log zero-progress states
+        total_computed = sum(
+            req.num_computed_tokens for req in self.running)
+        if total_computed == self._last_total_computed and self.running:
+            self._zero_progress_steps += 1
+        else:
+            self._zero_progress_steps = 0
+        self._last_total_computed = total_computed
+        if self._zero_progress_steps > 0 and self._zero_progress_steps % 100 == 0:
+            running_info = []
+            for req in self.running:
+                kv_p = req.kv_transfer_params or {}
+                running_info.append(
+                    f"  req={req.request_id} "
+                    f"computed={req.num_computed_tokens} "
+                    f"prompt={req.num_prompt_tokens} "
+                    f"tokens={req.num_tokens} "
+                    f"cp_ranks={req.cp_ranks} "
+                    f"status={req.status} "
+                    f"do_remote_decode={kv_p.get('do_remote_decode')} "
+                    f"do_remote_prefill={kv_p.get('do_remote_prefill')}")
+            waiting_info = []
+            for req in self.waiting:
+                kv_p = req.kv_transfer_params or {}
+                waiting_info.append(
+                    f"  req={req.request_id} "
+                    f"prompt={req.num_prompt_tokens} "
+                    f"cp_ranks={req.cp_ranks} "
+                    f"status={req.status} "
+                    f"do_remote_decode={kv_p.get('do_remote_decode')} "
+                    f"do_remote_prefill={kv_p.get('do_remote_prefill')}")
+            logger.warning(
+                "HANG_DIAG: %d steps with zero total progress. "
+                "dycp_has_decode=%s dycp_has_cp_prefill=%s "
+                "dycp_defer_prefills=%s stall_count=%d "
+                "running=%d waiting=%d\n%s\n%s",
+                self._zero_progress_steps,
+                dycp_has_decode, dycp_has_cp_prefill,
+                dycp_defer_prefills, self._dycp_stall_count,
+                len(self.running), len(self.waiting),
+                "\n".join(running_info) if running_info else "  (none)",
+                "\n".join(waiting_info[:5]) if waiting_info else "  (none)")
+
         # Use a temporary RequestQueue to collect requests that need to be
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
@@ -1087,11 +1161,17 @@ class CrossDPScheduler(Scheduler):
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                     is_ready = self._update_waiting_for_remote_kv(request)
                     if is_ready:
+                        logger.debug(
+                        "DYCP_DEBUG: req=%s READY from WAITING_FOR_REMOTE_KVS",
+                            request.request_id,
+                        )
                         request.status = RequestStatus.WAITING
                     else:
                         logger.debug(
-                            "%s is still in WAITING_FOR_REMOTE_KVS state.",
+                        "DYCP_DEBUG: req=%s still WAITING_FOR_REMOTE_KVS, "
+                            "in_finished_recving=%s",
                             request.request_id,
+                            request.request_id in self.finished_recving_kv_req_ids,
                         )
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
@@ -1122,12 +1202,25 @@ class CrossDPScheduler(Scheduler):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
+                            logger.debug(
+                        "DYCP_DEBUG: req=%s ext_tokens=None "
+                                "(KV not ready), skipping, "
+                                "load_kv_async=%s",
+                                request.request_id, load_kv_async,
+                            )
                             self.waiting.pop_request()
                             skipped_waiting_requests.prepend_request(request)
                             continue
 
                         request.num_external_computed_tokens = ext_tokens
                         num_external_computed_tokens = ext_tokens
+                        if ext_tokens > 0:
+                            logger.debug(
+                        "DYCP_DEBUG: req=%s ext_tokens=%d "
+                                "load_kv_async=%s, KV READY",
+                                request.request_id, ext_tokens,
+                                load_kv_async,
+                            )
 
                     # Total computed tokens (local + external).
                     num_computed_tokens = (
@@ -1246,6 +1339,12 @@ class CrossDPScheduler(Scheduler):
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
+                    logger.debug(
+                        "DYCP_DEBUG: req=%s entering WAITING_FOR_REMOTE_KVS, "
+                        "cp_ranks=%s, num_ext_tokens=%d",
+                        request.request_id, request.cp_ranks,
+                        num_external_computed_tokens,
+                    )
                     skipped_waiting_requests.prepend_request(request)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     continue
