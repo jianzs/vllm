@@ -68,6 +68,12 @@
   - Session 34（修复后）：200/200 成功，TPOT P50 = 11.02ms
   - TPOT 略高（11.02ms vs 8.1ms）可能由于 HANG_DIAG 诊断日志的开销
 
+  8. 混合 CP size benchmark（15x4K + 3x16K + 2x32K, 50 output, concurrency=4）：
+     - 20/20 成功，0 HANG_DIAG 警告
+     - CP=2 (4K): TTFT P50=575ms, TPOT P50=9.7ms
+     - CP=4 (16K): TTFT P50=1657ms, TPOT P50=12.4ms
+     - CP=8 (32K): TTFT P50=1797ms, TPOT P50=12.4ms
+
 - **下一步**：
   1. 运行混合 CP size benchmark（通过 `--use-local-json`）
   2. 清理 HANG_DIAG 和 DYCP_DEBUG 诊断日志（保留 WARNING 级别的 HANG_DIAG，降级或移除 DEBUG 级别的 DYCP_DEBUG）
