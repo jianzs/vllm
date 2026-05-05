@@ -1,6 +1,6 @@
 # DyCP Progress
 
-## 当前状态：Session 39 完成，性能验证通过，所有已知 bug 已修复
+## 当前状态：Session 39 完成，代码审查修复 2 个 bug，性能验证通过
 
 ### 2026-05-05 Session 39
 
@@ -66,6 +66,33 @@
 - **下一步**：
   1. 所有 P0/P1/P2 已完成，MEDIUM/HIGH bug 已修复，LOW 优先级问题可后续处理
   2. 可考虑：全面代码审查、边界条件分析、或性能优化（如 `dync_has_decode` 过于宽泛的优化）
+
+  4. 代码审查发现并修复 2 个 bug（commit `b4a612c75`）：
+
+  **MEDIUM: `dycp_has_prefill` 在 PCP split 后误判（Session 38 修复不完整）**（gpu_model_runner.py）：
+  - 问题：Session 38 修复在 `execute_model` 中计算 `dycp_has_prefill`，但该计算位于 `_prepare_inputs` 之后。`_prepare_inputs` 通过 `update_tokens_for_pcp` 修改 `num_scheduled_tokens_np`（PCP split），导致 POST-split 的 token count 可能为 1，使 `np.any(tokens > 1)` 返回 False，误判 prefill 为 decode
+  - 修复：在 `_prepare_inputs` 之前计算 `dycp_has_prefill_pre_split`，在 `_build_attention_metadata` 和 post-forward restore 中均使用此 PRE-split 值
+  - 影响：当 DyCP prefill 请求的 per-rank token count 恰好为 1 时（极端边界情况），allgather/hidden_states restore 会被跳过，导致输出错误。当前配置（max_num_batched_tokens=4096, cp_size<=8）下，per-rank token count 最小为 512，此 bug 不会触发
+
+  **LOW: PIECEWISE CUDA graph 缺少 cp_size > 1 守卫**（cudagraph_dispatcher.py）：
+  - 问题：`relax_for_mixed_batch_cudagraphs()` 返回的 relaxed key 丢弃 `cp_size`，FULL graph 已有 cp_size > 1 守卫跳过 relaxed 匹配，但 PIECEWISE 路径没有同样的守卫
+  - 修复：PIECEWISE 路径也添加 `cp_size <= 1` 条件，cp_size > 1 时跳过 relaxed 匹配回退 eager 模式
+  - 影响：当前安全（PIECEWISE 不包含 attention/NCCL 操作），防御性修复
+
+  5. 代码审查发现但未修复的问题（均为 LOW 或已知设计限制）：
+
+  **调度器**：
+  - LOW: Stall detector 依赖 `num_computed_tokens`（`_update_after_schedule` 预先递增），worker 级死锁时无法触发 escape hatch（已知限制，worker 级 NCCL 死锁已在 Session 31 修复）
+  - LOW: CP>1 请求无法抢占（已知设计限制，Session 27 文档化）
+  - LOW: `per_req_cp_sizes` 不包含 CP=1 请求（设计选择，CP=1 默认 `np.ones`）
+  - LOW: `_is_long_request` PD decode DyCP 交互（已知，Session 25 文档化）
+  - LOW: `CrossDPKVCacheManager.get_blocks` 静默丢弃越界 rank 索引（防御性代码，不应触发）
+
+  **Worker/Attention**：
+  - LOW: `get_padded_slot_mapping` 使用 `self.pcp_world_size` 而非 `actual_cp_size`（DyCP 路径不调用此函数，latent bug）
+  - LOW: IPC CUDA event 错误路径泄漏（Session 38 已修复成功路径，错误路径概率极低）
+  - LOW: `_compute_dualchunkswap_restore_idx` 不支持 per-request cp_size（当前 PD decode 始终 CP=1，不影响）
+  - LOW: DyCP decode batch ordering 不变量（DyCP 请求在前）无显式断言（由 `reorder_batch_to_split_cp_and_normal` 保证）
 
 ### 2026-05-05 Session 38
 
