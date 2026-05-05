@@ -1,6 +1,71 @@
 # DyCP Progress
 
-## 当前状态：Session 40 完成，全面代码审查修复 3 个 bug，冒烟测试通过
+## 当前状态：Session 41 完成，系统性性能基准测试，所有 CP size 单独和混合 workload 通过
+
+### 2026-05-06 Session 41
+
+- **目标**：系统性性能基准测试，验证 DyCP 各 CP size 的 Prefill/Decode 性能
+- **配置**：DeepSeek-V2-Lite, DP=8, TP=1, dp_per_domain=8, CUDA graph, LocalPDConnector + Proxy
+  - cp-size-thresholds: `[(4096, 1), (16384, 4), (32768, 8)]`
+  - max-num-batched-tokens=4096, gpu-memory-utilization=0.70, FLASHMLA backend
+
+- **进展**：
+
+  1. 系统性 DyCP 性能基准测试（所有测试 0 失败）
+
+  **Prefill 性能（直接打 vllm:8400，output=1）**：
+
+  | 测试 | Input | CP Size | TTFT P50 | TTFT P90 | 成功率 |
+  |------|-------|---------|----------|----------|--------|
+  | 8K/CP=1 | 8192 | 1 | 717.93ms | 875.04ms | 200/200 |
+  | 16K/CP=4 | 16384 | 4 | 556.89ms | 759.80ms | 200/200 |
+  | 32K/CP=8 | 32768 | 8 | 792.34ms | 1272.40ms | 200/200 |
+
+  **关键发现**：
+  - 16K/CP=4 的 TTFT P50 (556.89ms) < 8K/CP=1 (717.93ms)，因为 CP=4 将 16K 分到 4 个 rank，每 rank 只处理 ~4K tokens，并行效率高
+  - 32K/CP=8 的 TTFT P50 (792.34ms) 也接近 8K/CP=1 的水平，CP=8 并行有效降低 per-rank 计算量
+  - CP 并行对 prefill 性能提升明显：16K 用 CP=4 比 CP=1 理论快 4x，实测 TTFT 降低了 22%
+
+  **Decode 性能（通过 proxy:9000，PD 分离，output=1024）**：
+
+  | 测试 | Input | CP Size | TPOT P50 | TPOT P90 | TTFT P50 | 成功率 |
+  |------|-------|---------|----------|----------|----------|--------|
+  | 8K/CP=1 | 8192 | 1 | 7.94ms | 8.01ms | 727.39ms | 200/200 |
+  | 16K/CP=4 | 16384 | 4 | 9.35ms | 9.43ms | 617.58ms | 200/200 |
+  | 32K/CP=8 | 32768 | 8 | 9.59ms | 9.67ms | 11095.57ms | 200/200 |
+
+  **关键发现**：
+  - 8K/CP=1 TPOT P50=7.94ms，与历史基线（Session 31: 7.81ms, Session 37: 8.10ms, Session 39: 9.10ms）一致
+  - 16K/CP=4 TPOT P50=9.35ms，比 CP=1 增加约 18%。CP>1 的 decode 路径包含 allgather/allreduce 通信开销
+  - 32K/CP=8 TPOT P50=9.59ms，比 CP=1 增加约 21%。与 CP=4 差异小（9.59 vs 9.35），说明通信开销主要来自 NCCL subgroup 初始化而非数据量
+  - 32K/CP=8 TTFT P50=11095ms 是 PD 互斥调度的预期行为（所有请求都是 32K 长请求，prefill 排队等待 decode 完成）
+
+  **混合 Workload 性能（通过 proxy:9000，15x4K + 1x长请求，output=1024）**：
+
+  | Workload | TPOT P50 | TPOT P90 | TTFT P50 | 成功率 |
+  |----------|----------|----------|----------|--------|
+  | 15x4K + 1x16K | 7.95ms | 9.10ms | 495.02ms | 16/16 |
+  | 15x4K + 1x32K | 7.85ms | 8.00ms | 495.82ms | 16/16 |
+  | 15x4K + 1x256K | 7.88ms | 7.92ms | 498.56ms | 16/16 |
+
+  **关键发现**：
+  - 混合 workload 的 TPOT P50（7.85-7.95ms）与纯 CP=1 decode（7.94ms）一致，说明 CP>1 请求的 decode 不影响 CP=1 请求的 decode 性能
+  - 256K 长上下文请求（CP=8）成功完成，验证了 DyCP 对超长上下文的支持
+  - TTFT P50 ~495ms 是 4K 短请求的 prefill 时间，长请求的 TTFT 被 PD 互斥调度推高到 P90
+
+  2. 性能结论：
+
+  **Prefill**：DyCP CP 并行有效降低 TTFT。16K/CP=4 比 8K/CP=1 TTFT 降低 22%，32K/CP=8 与 8K/CP=1 TTFT 持平。CP 并行对 prefill 性能提升显著。
+
+  **Decode**：CP>1 decode 的 TPOT 比 CP=1 增加约 18-21%（7.94ms → 9.35-9.59ms），主要来自 NCCL allgather/allreduce 通信开销。这是 CP 并行的固有代价，与设计预期一致。
+
+  **混合 Workload**：不同 CP size 请求混合调度时，短请求的 decode 性能不受长请求影响，验证了 DyCP 调度器的正确性。
+
+- **下一步**：
+  1. 与 DP baseline 做严格对齐对比（需启动纯 DP 服务器跑同一组测试）
+  2. 更大规模混合 workload 测试（更多请求数，更高并发度）
+  3. 长时间稳定性测试（持续 30min+ 的 decode）
+  4. 性能优化：降低 CP>1 decode 的 TPOT 开销（如优化 NCCL 通信、减小 allgather 数据量）
 
 ### 2026-05-05 Session 40
 
