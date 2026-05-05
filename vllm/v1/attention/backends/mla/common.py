@@ -939,7 +939,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             dycp_cp_virtual_block_size = (
                 self.cp_local_block_size * actual_cp_size
                 if actual_cp_size > 1
-                else self.cp_virtual_block_size
+                else self.cp_local_block_size
             )
             dycp_padded_local_max_chunk = (
                 cdiv(dycp_max_context_chunk, dycp_cp_virtual_block_size)
@@ -1434,7 +1434,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     dycp_eff_virtual_block_size = (
                         self.cp_local_block_size * actual_cp_size
                         if actual_cp_size > 1
-                        else self.cp_virtual_block_size
+                        else self.cp_local_block_size
                     )
                     assert max_context_chunk % actual_cp_size == 0
                     padded_local_max_context_chunk_across_ranks = (

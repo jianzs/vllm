@@ -870,10 +870,18 @@ class LocalPDConnector(KVConnectorBase_V1):
             # Clean up any stale load registration. If the request was
             # cancelled or preempted after update_state_after_alloc but
             # before build_connector_meta processed it, the entry would
-            # otherwise leak indefinitely.
+            # otherwise leak indefinitely.  Preemption clears cp_ranks,
+            # so we also scan all ranks as a fallback.
+            cleaned_ranks = set(request.cp_ranks)
             for cp_rank in request.cp_ranks:
                 self._cross_requests_need_load[cp_rank].pop(
                     request.request_id, None)
+            # Fallback: if cp_ranks was cleared by preemption, scan
+            # all ranks to remove stale entries.
+            if not cleaned_ranks:
+                for rank in range(len(self._cross_requests_need_load)):
+                    self._cross_requests_need_load[rank].pop(
+                        request.request_id, None)
             return False, None
 
         return False, None
@@ -948,6 +956,13 @@ class LocalPDConnector(KVConnectorBase_V1):
         per_rank_block_ids = meta.get("per_rank_block_ids")
         if not per_rank_block_ids:
             logger.error("No per_rank_block_ids for prefix=%s", prefix)
+            return
+        if len(per_rank_block_ids) < cp_world_size:
+            logger.error(
+                "per_rank_block_ids length %d < cp_world_size %d "
+                "for prefix=%s",
+                len(per_rank_block_ids), cp_world_size, prefix,
+            )
             return
 
         cp_world_size = meta.get("cp_world_size", self._cp_world_size)
