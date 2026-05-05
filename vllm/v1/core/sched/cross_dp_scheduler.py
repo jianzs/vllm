@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 from collections import defaultdict
@@ -346,7 +347,12 @@ class CrossDPScheduler(Scheduler):
             request = self.requests[req_id]
             if len(request.cp_ranks) == 1:
                 request.num_computed_tokens += num_scheduled_token
-            elif len(request.cp_ranks) > 1 and scheduler_output.cp_rank == 0:
+            elif (len(request.cp_ranks) > 1
+                  and scheduler_output.cp_rank == request.cp_ranks[0]):
+                # Only update on the first rank of the CP group to avoid
+                # double-counting. Must use cp_ranks[0] (first rank in
+                # the CP subgroup), not global rank 0 — e.g., a CP=4
+                # request on ranks [4,5,6,7] has cp_ranks[0]=4.
                 request.num_computed_tokens += num_scheduled_token
 
             # NOTE: _free_encoder_inputs relies on num_computed_tokens, which
@@ -872,12 +878,22 @@ class CrossDPScheduler(Scheduler):
                 kv_params = request.kv_transfer_params
                 is_pd_decode = (
                     kv_params and kv_params.get("do_remote_prefill"))
-                if is_pd_decode or len(self.running) <= 2:
-                    logger.debug(
+                # Always warn for prefill requests stuck at computed=0
+                # (critical hang indicator)
+                is_stuck_prefill = (
+                    request.num_computed_tokens == 0
+                    and request.num_prompt_tokens > 0
+                    and not is_pd_decode
+                )
+                if is_stuck_prefill or is_pd_decode or len(self.running) <= 2:
+                    eff_b = _get_effective_budget(request.cp_ranks)
+                    logger.log(
+                        logging.WARNING if is_stuck_prefill else logging.DEBUG,
                         "DYCP_DEBUG: RUNNING req=%s num_new_tokens=0 "
                         "num_computed=%d num_tokens_with_spec=%d "
                         "num_output_placeholders=%d num_prompt=%d "
                         "num_tokens=%d cp_ranks=%s is_pd_decode=%s "
+                        "eff_budget=%d rank_budgets=%s "
                         "running_count=%d",
                         request.request_id,
                         request.num_computed_tokens,
@@ -887,6 +903,8 @@ class CrossDPScheduler(Scheduler):
                         request.num_tokens,
                         request.cp_ranks,
                         is_pd_decode,
+                        eff_b,
+                        rank_budgets,
                         len(self.running),
                     )
                 req_index += 1
