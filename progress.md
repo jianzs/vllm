@@ -1,6 +1,90 @@
 # DyCP Progress
 
-## 当前状态：混合 CP size 性能 benchmark 阶段
+## 当前状态：CP=4 hang bug 未复现，准备 CP=8 和混合 CP benchmark
+
+### 2026-05-05 Session 34
+
+- **目标**：调查并修复 CP=4 + LocalPDConnector 最后请求卡住 bug（Session 33 遗留）
+- **进展**：
+  1. 添加 HANG_DIAG 零进展检测器到 `cross_dp_scheduler.py`（commit `fd0da37cd`）：
+     - 跟踪 `_zero_progress_steps` 和 `_last_total_computed`
+     - 每 100 步零进展输出 WARNING 日志，包含 running/waiting 请求详细状态
+     - 用于定位 hang 的根因（如果再次出现）
+  2. 添加 DYCP_DEBUG 诊断日志到 `cross_dp_scheduler.py`（commit `fd0da37cd`）：
+     - RUNNING 请求 `num_new_tokens=0` 时的详细状态
+     - `finished_sending`/`finished_recving` KV transfer 事件
+     - `WAITING_FOR_REMOTE_KVS` 状态转换
+     - `ext_tokens` 计算和 KV 就绪状态
+     - `_free_request` 的 delay_free 和 PD prefix 状态
+     - 所有日志均为 `logger.debug` 级别，不影响生产环境
+  3. `local_pd_connector.py` 的 DYCP_DEBUG 日志已回退（Session 33 添加的 `logger.warning` 过于嘈杂）
+  4. **CP=4 hang bug 未复现在本 session**：
+     - 200 请求测试（16K input, 50 output, CP=4, concurrency=4, request-rate=4）全部完成（200/200）
+     - Session 33 报告的 199/200 hang 可能已被 Session 32 的两个修复解决：
+       - `dyncp_batch_cp_size` 初始化包含 decode 请求（commit `e142318e7`）
+       - meta 变量遮蔽修复（commit `0e424a9e8`）
+     - 也可能是间歇性 bug，需要更多测试确认
+  5. `_prefill_requests` 泄漏分析：
+     - `_prefill_requests` dict 在 `get_num_new_matched_tokens` 和 `build_connector_meta` 中添加条目
+     - 只在 `request_finished` 中移除，没有 orphan cleanup
+     - 但测试中未观察到泄漏（`prefill=1` 是活跃 prefill 的正常状态）
+  6. GPU 进程清理：测试后清理僵尸 GPU 进程（`nvidia-smi --query-compute-apps=pid` + `kill -9`）
+  7. vLLM bench serve 兼容性问题：
+     - proxy 使用 `auto` 作为 model name，benchmark 工具需要实际 model path
+     - benchmark 工具无法正确解析 proxy streaming 响应（output_tokens=0）
+     - 使用 Python OpenAI client 直接测试可绕过此问题
+
+- **Bug 状态更新**：
+  - CP=4 hang bug：**未确认修复**（无法复现，但可能间歇性出现）
+  - HANG_DIAG 诊断器已就位，如果 bug 再次出现可以快速定位根因
+  - `_prefill_requests` 缺少 orphan cleanup 是潜在问题，但当前不是 hang 的根因
+
+- **下一步**：
+  1. 运行 CP=8 (32K) benchmark
+  2. 运行混合 CP size benchmark（通过 `--use-local-json`）
+  3. 更多 CP=4 hang 复现测试（更长运行时间、更多请求）
+  4. MEDIUM 优先级问题修复（`has_slot_for_long_request` 缓存、`running_long_count` 变异风险）
+  5. 清理 DYCP_DEBUG 诊断日志（cross_dp_scheduler.py 中保留，local_pd_connector.py 已回退）
+
+### 2026-05-04 Session 33
+
+- **目标**：调查并修复 CP=4 + LocalPDConnector 最后请求卡住的 bug
+- **进展**：
+  1. 代码分析：系统性审查调度器和 LocalPDConnector 代码路径
+  2. 添加 DYCP_DEBUG 诊断日志（3 处）：
+     - `cross_dp_scheduler.py`：RUNNING 请求 `num_new_tokens==0` 时详细日志
+     - `cross_dp_scheduler.py`：`finished_sending` 释放 prefill blocks 时日志
+     - `local_pd_connector.py`：PD decode 请求 `build_connector_meta` 时日志
+     - `local_pd_connector.py`：`start_load_kv` IPC/legacy 路径选择日志
+  3. SSH 连接中断，未能在远程机器上运行测试
+
+- **Bug 分析**（未确认，基于代码审查的假设）：
+
+  **假设 1：`num_new_tokens` 死亡螺旋**
+  - PD decode 请求第一步模型未产出 token → `num_computed_tokens` 前进但 `num_tokens_with_spec` 不变
+  - 后续步骤 `num_new_tokens` 依赖 `num_output_placeholders` 机制，理论上应该保持 1
+  - 但如果 `num_output_placeholders` 条件判断失败，请求可能永久卡在 `num_new_tokens=0`
+
+  **假设 2：`finished_sending` 过早释放 prefill blocks**
+  - CP=4 的 IPC 事件完成后，`_update_from_kv_xfer_finished` 释放 prefill blocks
+  - 如果释放发生在 decode 请求的 IPC load 之前，KV 数据可能丢失
+  - 但代码分析表明 `finished_sending` 只在 IPC load 完成后触发，时序应该正确
+
+  **假设 3：资源泄漏导致最后请求无法获得资源**
+  - CP=4 与 CP=1/CP=2 的区别在于使用更多 rank 和 block
+  - 可能存在 block 泄漏或 IPC handle 泄漏，累积到一定程度影响最后请求
+
+  **关键观察**：
+  - 始终是最后一个请求卡住（199/200, 49/50），不是随机请求
+  - CP=1 和 CP=2 不受影响
+  - 前 N-1 个请求的 TPOT 与基线对齐，功能正常
+  - "Running: 1 reqs, 0 throughput, 0% KV cache"
+
+- **下一步**：
+  1. SSH 恢复后启动服务器，运行最小复现测试（3-5 个 CP=4 请求通过 proxy）
+  2. 分析 DYCP_DEBUG 日志定位卡住原因
+  3. 根据日志修复 bug
+  4. Torch inductor cache 问题需清理 `/tmp/torchinductor_root`
 
 ### 2026-05-04 Session 32
 
