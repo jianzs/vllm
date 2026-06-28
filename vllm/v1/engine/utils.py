@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
+import concurrent.futures
 import contextlib
 import os
 import threading
@@ -40,6 +42,11 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 STARTUP_POLL_PERIOD_MS = 10000
+
+# Threshold for switching to async parallel startup of EngineCore processes.
+# When local_engine_count > this value, all processes are started concurrently
+# via asyncio.gather() to reduce total startup time from O(N) to O(1).
+_ASYNC_STARTUP_ENGINE_THRESHOLD = 1
 
 
 class CoreEngineState(Enum):
@@ -136,9 +143,10 @@ class CoreEngineProcManager:
         client_handshake_address: str | None = None,
         tensor_queue: Queue | None = None,
     ):
+        import copy
+
         context = get_mp_context()
         common_kwargs = {
-            "vllm_config": vllm_config,
             "local_client": local_client,
             "handshake_address": handshake_address,
             "executor_class": executor_class,
@@ -149,24 +157,44 @@ class CoreEngineProcManager:
         if client_handshake_address:
             common_kwargs["client_handshake_address"] = client_handshake_address
 
-        is_dp = vllm_config.parallel_config.data_parallel_size > 1
-
         from vllm.v1.engine.core import EngineCoreProc
 
+        data_parallel = vllm_config.parallel_config.data_parallel_size > 1
+        needs_device_env_isolation = (
+            not (current_platform.is_cuda_alike() or current_platform.is_xpu())
+            or vllm_config.parallel_config.use_ray
+        )
+        user_assigned_gpu_ids = (
+            vllm_config.parallel_config.assigned_physical_gpu_ids
+        )
+
         self.processes: list[BaseProcess] = []
+        proc_vllm_configs: list[VllmConfig] = []
         local_dp_ranks = []
         for index in range(local_engine_count):
             local_index = local_start_index + index
             global_index = start_index + index
 
+            proc_vllm_config = vllm_config
+            if data_parallel and needs_device_env_isolation:
+                proc_vllm_config = copy.deepcopy(vllm_config)
+                set_assigned_physical_gpu_ids_for_dp_rank(
+                    proc_vllm_config, local_index, user_assigned_gpu_ids
+                )
+
             # Start EngineCore in background process.
             local_dp_ranks.append(local_index)
+            proc_vllm_configs.append(proc_vllm_config)
             self.processes.append(
                 context.Process(
                     target=EngineCoreProc.run_engine_core,
-                    name=f"EngineCore_DP{global_index}" if is_dp else "EngineCore",
-                    kwargs=common_kwargs
-                    | {"dp_rank": global_index, "local_dp_rank": local_index},
+                    name=(f"EngineCore_DP{global_index}" if data_parallel
+                          else "EngineCore"),
+                    kwargs=common_kwargs | {
+                        "vllm_config": proc_vllm_config,
+                        "dp_rank": global_index,
+                        "local_dp_rank": local_index,
+                    },
                 )
             )
 
@@ -174,44 +202,104 @@ class CoreEngineProcManager:
         self.manager_stopped = threading.Event()
         self.failed_proc_name: str | None = None
 
-        # All ranks share this config object: capture the user-provided
-        # --device-ids list before the per-rank shard overwrites it. Mutating
-        # the config before each proc.start() works because the spawn method
-        # pickles process args at start() time, sequentially per rank.
-        user_assigned_gpu_ids = vllm_config.parallel_config.assigned_physical_gpu_ids
-        try:
-            for proc, local_dp_rank in zip(self.processes, local_dp_ranks):
-                # Populate the logical-to-physical GPU mapping in DP for
-                # platforms that cannot rely on
-                # torch.accelerator.set_device_index(), and for Ray.
-                needs_device_env_isolation = not (
-                    current_platform.is_cuda_alike() or current_platform.is_xpu()
+        # Start all processes concurrently to avoid O(N) sequential startup
+        # latency. Serial path is taken only for single-engine deployments.
+        use_async_startup = local_engine_count > _ASYNC_STARTUP_ENGINE_THRESHOLD
+        if use_async_startup:
+            logger.info(
+                "Using async parallel startup for %d EngineCore processes.",
+                local_engine_count,
+            )
+            try:
+                self._run_async_startup(proc_vllm_configs, local_dp_ranks)
+                logger.info(
+                    "All %d EngineCore processes started successfully.",
+                    local_engine_count,
                 )
-                if is_dp and (
-                    needs_device_env_isolation or vllm_config.parallel_config.use_ray
+            finally:
+                if self.finished_procs():
+                    self.shutdown()
+        else:
+            try:
+                for proc, proc_vllm_config, local_dp_rank in zip(
+                    self.processes, proc_vllm_configs, local_dp_ranks
                 ):
-                    set_assigned_physical_gpu_ids_for_dp_rank(
-                        vllm_config, local_dp_rank, user_assigned_gpu_ids
-                    )
+                    with numa_utils.configure_subprocess(
+                        proc_vllm_config,
+                        local_rank=0,
+                        dp_local_rank=local_dp_rank,
+                        process_kind="EngineCore",
+                    ):
+                        proc.start()
+            finally:
+                if self.finished_procs():
+                    self.shutdown()
 
+    def _run_async_startup(
+        self,
+        proc_vllm_configs: list[VllmConfig],
+        local_dp_ranks: list[int],
+    ) -> None:
+        """Run _start_processes_async() in an event loop.
+
+        Handles the case where we are already inside a running event loop
+        (e.g. called from AsyncLLM) by offloading to a dedicated thread
+        with its own loop, avoiding nested asyncio.run() calls.
+        """
+        try:
+            asyncio.get_running_loop()
+            # Already inside an event loop - spin up a fresh loop in a
+            # background thread to avoid nesting asyncio.run() calls.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    asyncio.run,
+                    self._start_processes_async(
+                        proc_vllm_configs, local_dp_ranks
+                    ),
+                )
+                future.result()
+        except RuntimeError:
+            # No running loop - safe to call asyncio.run() directly.
+            asyncio.run(
+                self._start_processes_async(proc_vllm_configs, local_dp_ranks)
+            )
+
+    async def _start_processes_async(
+        self,
+        proc_vllm_configs: list[VllmConfig],
+        local_dp_ranks: list[int],
+    ) -> None:
+        """Start all EngineCore processes concurrently.
+
+        Each proc.start() is offloaded to the thread pool via
+        asyncio.to_thread so that NUMA binding context managers can be
+        applied per-process without blocking the event loop.
+        """
+
+        async def _start_one(
+            proc: BaseProcess,
+            proc_vllm_config: VllmConfig,
+            local_dp_rank: int,
+        ) -> None:
+            def _start_with_numa() -> None:
                 with numa_utils.configure_subprocess(
-                    # EngineCore itself does not have a TP/PP-local rank.
-                    # When DP is enabled, set_assigned_physical_gpu_ids_for_dp_rank()
-                    # populates the logical-to-physical mapping for this DP
-                    # shard, so local_rank=0 means "the first local GPU in
-                    # this shard". The actual TP/PP worker processes spawned
-                    # by the executor are bound separately with their own
-                    # local_rank values.
-                    vllm_config,
+                    proc_vllm_config,
                     local_rank=0,
                     dp_local_rank=local_dp_rank,
                     process_kind="EngineCore",
                 ):
                     proc.start()
-        finally:
-            # Kill other procs if not all are running.
-            if self.finished_procs():
-                self.shutdown()
+
+            await asyncio.to_thread(_start_with_numa)
+
+        await asyncio.gather(
+            *(
+                _start_one(proc, proc_vllm_config, rank)
+                for proc, proc_vllm_config, rank in zip(
+                    self.processes, proc_vllm_configs, local_dp_ranks
+                )
+            )
+        )
 
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown engine core processes with configurable timeout."""
