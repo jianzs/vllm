@@ -1677,6 +1677,8 @@ class MooncakeConnectorWorker:
             if isinstance(layer_spec, MambaSpec):
                 conv, _ = cache_or_caches
                 cache_list = [conv]
+            elif isinstance(cache_or_caches, (list, tuple)):
+                cache_list = list(cache_or_caches)
             else:
                 # K and V are packed into one blocks-first tensor per layer,
                 # so each layer registers as a single region.
