@@ -170,6 +170,8 @@ class Request:
         self.last_sched_seq = 0
 
         self.spec_token_ids: list[int] = []
+        # Drafts already scheduled in a sync PP frame whose output is pending.
+        self.num_spec_tokens_in_flight = 0
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 
